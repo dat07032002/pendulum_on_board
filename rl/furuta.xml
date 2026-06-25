@@ -20,22 +20,30 @@
 
   <worldbody>
     <light pos="0 0 1.0" dir="0 0 -1"/>
-    <geom type="cylinder" size="0.012 0.05" pos="0 0 0.05" rgba=".25 .25 .25 1"/>
 
-    <body name="arm" pos="0 0 0.10">
-      <joint name="arm" type="hinge" axis="0 0 1" damping="9.4e-4" frictionloss="6.0e-3"/>
-      <!-- arm own z-inertia = J_ARM (rotor + arm mass); mass on-axis so it only sets Izz -->
-      <inertial pos="0 0 0" mass="0.015" diaginertia="6.84e-5 6.84e-5 6.84e-5"/>
-      <geom type="capsule" fromto="0 0 0 0.035 0 0" size="0.004" rgba=".2 .45 .85 1"/>
+    <!-- TILTING BASE: the whole Furuta rig sits on a board that tilts about y (one fixed axis,
+         at the stand base z=0). Driven by a stiff position actuator tracking beta_ref(t); the
+         servo (LX-16A) is modeled only as this near-kinematic tracker. The board angle = beta. -->
+    <body name="board" pos="0 0 0">
+      <joint name="tilt" type="hinge" axis="0 1 0" damping="0.5" range="-0.7 0.7"/>
+      <inertial pos="0 0 0.05" mass="0.2" diaginertia="2e-3 2e-3 2e-3"/>
+      <geom type="cylinder" size="0.012 0.05" pos="0 0 0.05" rgba=".25 .25 .25 1"/>
 
-      <body name="pole" pos="0.035 0 0">
-        <!-- axis = -x so +V -> +theta_dot, matching the measured firmware convention
-             (sign_check: +V -> +theta_dot). Keeps sim<->firmware obs/action mapping 1:1. -->
-        <joint name="pole" type="hinge" axis="-1 0 0" damping="5.06e-5" frictionloss="0.35e-3"/>
-        <!-- CoM L_P below pivot; about-CoM Ixx=8.4e-6 -> about-pivot 4.64e-5 -> alpha=214 -->
-        <inertial pos="0 0 -0.0375" mass="0.027" diaginertia="8.4e-6 8.4e-6 1e-7"/>
-        <geom type="capsule" fromto="0 0 0 0 0 -0.075" size="0.003" rgba=".85 .3 .2 1"/>
-        <site name="tip" pos="0 0 -0.075" size="0.005"/>
+      <body name="arm" pos="0 0 0.10">
+        <joint name="arm" type="hinge" axis="0 0 1" damping="9.4e-4" frictionloss="6.0e-3"/>
+        <!-- arm own z-inertia = J_ARM (rotor + arm mass); mass on-axis so it only sets Izz -->
+        <inertial pos="0 0 0" mass="0.015" diaginertia="6.84e-5 6.84e-5 6.84e-5"/>
+        <geom type="capsule" fromto="0 0 0 0.035 0 0" size="0.004" rgba=".2 .45 .85 1"/>
+
+        <body name="pole" pos="0.035 0 0">
+          <!-- axis = -x so +V -> +theta_dot, matching the measured firmware convention
+               (sign_check: +V -> +theta_dot). Keeps sim<->firmware obs/action mapping 1:1. -->
+          <joint name="pole" type="hinge" axis="-1 0 0" damping="5.06e-5" frictionloss="0.35e-3"/>
+          <!-- CoM L_P below pivot; about-CoM Ixx=8.4e-6 -> about-pivot 4.64e-5 -> alpha=214 -->
+          <inertial pos="0 0 -0.0375" mass="0.027" diaginertia="8.4e-6 8.4e-6 1e-7"/>
+          <geom type="capsule" fromto="0 0 0 0 0 -0.075" size="0.003" rgba=".85 .3 .2 1"/>
+          <site name="tip" pos="0 0 -0.075" size="0.005"/>
+        </body>
       </body>
     </body>
   </worldbody>
@@ -43,5 +51,7 @@
   <actuator>
     <!-- ctrl = motor voltage [V]; gear = KM so applied torque = KM*ctrl -->
     <motor name="motor" joint="arm" gear="0.0127" ctrlrange="-6 6"/>
+    <!-- tilt: stiff position servo tracking beta_ref [rad] (board/LX-16A). ctrl = beta_ref. -->
+    <position name="tilt" joint="tilt" kp="50" ctrlrange="-0.6 0.6"/>
   </actuator>
 </mujoco>
