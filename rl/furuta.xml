@@ -1,0 +1,47 @@
+<!--
+  Furuta pendulum — GM3506 rig, parameters from this session's system ID (sysid.json).
+  Arm rotates about vertical z (motor axis); pole pivots on a radial axis (parallel to the
+  arm) at radius L_ARM and hangs down (-z) at rest (pole joint = 0 -> hanging, pi -> upright).
+
+  Measured / derived values baked in:
+    alpha = M_ROD*L_P*G / J_P = 214  (period 0.43 s)  -> J_P = 4.64e-5
+    Arm:  J_ARM = 6.84e-5 (z-inertia);  damping(viscous) = 9.4e-4;  frictionloss(Coulomb) ~6e-3
+    Pole: damping(viscous) = 5.06e-5;   frictionloss(Coulomb) = 0.35e-3
+    Actuator: torque = KM*V, KM = 0.0127 N*m/V, V in [-6,6]  (motor gear = KM)
+  Pole inertial: about-CoM Ixx s.t. about-pivot = J_cm + M_ROD*L_P^2 = 4.64e-5.
+-->
+<mujoco model="furuta">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.0005" integrator="RK4" gravity="0 0 -9.81"/>
+
+  <default>
+    <geom contype="0" conaffinity="0"/>   <!-- no collisions; this is a kinematic model -->
+  </default>
+
+  <worldbody>
+    <light pos="0 0 1.0" dir="0 0 -1"/>
+    <geom type="cylinder" size="0.012 0.05" pos="0 0 0.05" rgba=".25 .25 .25 1"/>
+
+    <body name="arm" pos="0 0 0.10">
+      <joint name="arm" type="hinge" axis="0 0 1" damping="9.4e-4" frictionloss="6.0e-3"/>
+      <!-- arm own z-inertia = J_ARM (rotor + arm mass); mass on-axis so it only sets Izz -->
+      <inertial pos="0 0 0" mass="0.015" diaginertia="6.84e-5 6.84e-5 6.84e-5"/>
+      <geom type="capsule" fromto="0 0 0 0.035 0 0" size="0.004" rgba=".2 .45 .85 1"/>
+
+      <body name="pole" pos="0.035 0 0">
+        <!-- axis = -x so +V -> +theta_dot, matching the measured firmware convention
+             (sign_check: +V -> +theta_dot). Keeps sim<->firmware obs/action mapping 1:1. -->
+        <joint name="pole" type="hinge" axis="-1 0 0" damping="5.06e-5" frictionloss="0.35e-3"/>
+        <!-- CoM L_P below pivot; about-CoM Ixx=8.4e-6 -> about-pivot 4.64e-5 -> alpha=214 -->
+        <inertial pos="0 0 -0.0375" mass="0.027" diaginertia="8.4e-6 8.4e-6 1e-7"/>
+        <geom type="capsule" fromto="0 0 0 0 0 -0.075" size="0.003" rgba=".85 .3 .2 1"/>
+        <site name="tip" pos="0 0 -0.075" size="0.005"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!-- ctrl = motor voltage [V]; gear = KM so applied torque = KM*ctrl -->
+    <motor name="motor" joint="arm" gear="0.0127" ctrlrange="-6 6"/>
+  </actuator>
+</mujoco>

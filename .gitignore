@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+serial_log.txt
+serial_in.txt
+.arduino-build/

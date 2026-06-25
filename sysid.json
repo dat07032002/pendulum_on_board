@@ -1,0 +1,89 @@
+{
+  "freeswing": {
+    "runs": 3,
+    "period_s": 0.44,
+    "wn": 14.28,
+    "alpha_meas": 204,
+    "alpha_model": 196,
+    "alpha_status": "validated_within_4pct",
+    "friction_type": "coulomb",
+    "Tf_mNm": 0.7,
+    "deadband_deg": 4,
+    "eff_zeta": 0.16,
+    "note": "alpha confirmed 3x ~204; clean 45deg run gives Tf~0.7mNm deadband~4deg"
+  },
+  "arm_id": {
+    "foc_offset_fixed": "270->300, asymmetry 2x->1.0",
+    "KM_over_Jarm": 186,
+    "KM_over_DAMPING": 19.27,
+    "KE_eff": 0.052,
+    "KM_meas": 0.0127,
+    "Jarm_meas": 6.5e-05,
+    "DAMPING_meas": 0.00065,
+    "KM_model": 0.0121,
+    "Jarm_model": 6.84e-05,
+    "DAMPING_model": 0.000826,
+    "friction_Vth": 0.15,
+    "note": "FOC asymmetry was the critical find/fix; KM and J_arm validate within 5pct, DAMPING ~20pct low"
+  },
+  "sign_check": {
+    "result": "coupling MATCHES model (no flip)",
+    "phi_dot_init": 4.7,
+    "theta_dot_init": 3.71,
+    "predicted_theta_ddot": 221.8,
+    "note": "used initial-response window; 0.3s-window gave false flip"
+  },
+  "actuator_id": {
+    "terminal": {
+      "0.2": 0.0126,
+      "-0.2": 0.0122,
+      "0.4": 3.2395,
+      "-0.4": 3.2947,
+      "0.6": 9.3697,
+      "-0.6": 9.4837,
+      "0.8": 13.1919,
+      "-0.8": 13.9936,
+      "1.0": 19.0274,
+      "-1.0": 18.9116,
+      "1.5": 25.4428,
+      "-1.5": 23.14565,
+      "2.0": 28.5258,
+      "-2.0": 25.5308
+    },
+    "accel": {
+      "1.0": 147.17547849156432,
+      "-1.0": 145.92430833279687,
+      "2.0": 239.80335626794587,
+      "-2.0": 228.95269441469222,
+      "3.0": 291.5733451446703,
+      "-3.0": 281.6298067762001,
+      "4.0": 365.9695309456421,
+      "-4.0": 307.69815670908247,
+      "5.0": 586.5023496613769,
+      "-5.0": 512.2052370729193,
+      "6.0": 631.9805051861639,
+      "-6.0": 586.1107571183155
+    }
+  },
+  "arm_friction": {
+    "DAMPING_over_J": 13.809324639612502,
+    "Tc_over_J": 100.23867254252426,
+    "DAMPING": 0.0009442125722335049,
+    "Tc": 0.006853819235095097,
+    "V_break": 0.23656344413757324
+  },
+  "friction_id": {
+    "rho": 0.898092628793845,
+    "C_deg": 4.07043248454059,
+    "zeta": 0.034212604161848625,
+    "b_theta": 5.06165542877801e-05,
+    "Tf": 0.00035281900168169107,
+    "alpha": 213.51226395001316,
+    "n_pairs": 15
+  },
+  "latency": {
+    "loop_ms_mean": 5.0,
+    "filter_lag_ms": 5.000000000000001,
+    "filter_lag_steps": 1.0
+  }
+}
