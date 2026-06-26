@@ -34,3 +34,37 @@ sufficient** — the real judge is the hardware. Use this for Step 6 (validate) 
 
 ## Quick reference
 sim-good = Pass 1–3 (under DR) + smoothness. deploy-ready = + Pass 4. done = Pass 5 on hardware.
+
+---
+
+# Tilt-project additions (randomly-tilting base, ±30°)
+
+This project extends the above to a base that tilts ±30° (LX-16A servo), with `β`/`β̇` from a
+BNO086 IMU. The policy must balance to **true (gravity) vertical**, not base-frame. Extra gates:
+
+## Pass 1-T — success under random tilt (the headline gate)
+- **Success ≥ 80% under random ±30° tilt**, across tilt **amplitude (0–30°) AND rate (0–2 rad/s)**,
+  *on top of* the existing plant DR (KM/friction/latency). Evaluate deterministically.
+- **True-vertical hold:** `true_up` (geometric, from `_true_up()`) stays high through the whole tilt
+  trajectory — i.e. it tracks **gravity** vertical as the board moves, not base-frame "up".
+- **Arm stays within ±180°** the whole time (no cable-limit hits); auto-recovery is a backstop, not
+  the plan.
+
+## Pass 3-T — worst-orientation robustness
+- Survives **transits through arm φ ≈ 90°** (swing plane aligned with the tilt → max disturbance,
+  per Phase 0). Don't only test the benign φ≈0 orientation.
+
+## Pass 4-T — IMU / β sim-to-real readiness
+- **β-noise robustness:** holds with the modeled BNO086 fusion noise on β (and at the 200 Hz I²C
+  read rate; if hardware falls back to 100 Hz, retrain with `IMU_DECIM=2`).
+- **β sign/scale alignment** at PC-in-loop: `+β` in firmware (IMU tilt direction) must match the sim
+  convention, alongside the existing `sinθ`/`θ̇`/action sign checks. `β` is normalized by 0.6 rad.
+- **Use the IMU's mag-free fusion** (Game Rotation Vector / Gravity) — the motors disturb the
+  magnetometer.
+
+## Pass 5-T — hardware (final)
+- PC-in-loop then on-chip `MODE_RL` (**8-D obs**), balancing while the LX-16A drives random ±30°
+  tilt; quantify success rate + arm/cable margin under tilt.
+
+**Tilt quick ref:** tilt-sim-good = Pass 1-T + 3-T (under tilt+plant DR) + smoothness.
+deploy-ready = + Pass 4-T. done = Pass 5-T on the tilting rig.

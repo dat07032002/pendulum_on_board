@@ -1,317 +1,202 @@
-# HANDOFF — Furuta Pendulum (GM3506) RL swing-up + balance
+# HANDOFF — Furuta pendulum on a randomly-TILTING base (±30°)
 
-Last updated 2026-06-24 22:00 CDT. This is the state + context so another agent can continue.
-The full step-plan lives at `~/.claude/plans/async-beaming-teapot.md`.
+Last updated 2026-06-26. This is the full state + context so another agent can continue.
+The step-plan lives at `~/.claude/plans/async-beaming-teapot.md` (the "ACTIVE PLAN" section at top).
 
-## ✅ RESULT — WORKING on hardware (on-chip)
+This is **project #2**, built on top of a completed project #1. Read both sections below.
 
-**The sim-trained TQC policy runs standalone on the ESP32 (`MODE_RL`) and does the full task:
-swing-up + balance + arm-centering + disturbance rejection** (user-confirmed 2026-06-24). This
-is the goal — a friction-robust nonlinear controller the classical LQR could not achieve.
-Deployed model: `rl/models/fix_sde/best_model.zip` → `rl/policy_weights.h` (also copied into the
-sketch as `firmware/furuta_foc/policy_weights.h`).
+---
 
-Path that worked: actuator step-test (real lag ~15 ms = already modeled, so the lag/slew realism
-fears were pessimistic) → hardened env (arm-envelope + corner DR) → PC-in-loop sign-check +
-balance (signs correct) → **on-chip MLP**. Removing the PC-in-loop serial latency is what made
-balance reliable. See "On-chip deployment" + "Tooling added this session" below.
+## 0. TL;DR / current state
 
-## Goal
+**Goal:** mount the working GM3506 Furuta rig on a board that **tilts ±30° about one axis** (driven
+by a Hiwonder **LX-16A** servo making *random* tilts), and have the pendulum **keep balancing
+upright (true gravity-vertical)** through the motion. Board tilt `β`/`β̇` are measured by a **BNO086
+IMU** on the board. One ESP32 runs everything. Deploy on-chip like project #1.
 
-A self-balancing Furuta (rotary inverted) pendulum on a **GM3506 gimbal motor**. Classical
-LQR balances in sim but **fails on hardware because of pendulum-pivot friction** (the arm
-winds to its cable limit). So the current plan: train a **single TQC policy** (MuJoCo +
-domain randomization + curriculum) for **swing-up AND balance**, robust to that friction,
-and deploy it to the ESP32.
+**Where we are:**
+- ✅ **Phase 0** (sim feasibility) done — ±30° is physically feasible; orientation-dependent.
+- ✅ **Phase 1 CODE** done — 8-D tilt env, true-vertical reward, tilt curriculum, post-mortem train
+  fixes, obs-agnostic exporter. All validated locally.
+- ⏳ **Phase 1 TRAIN** RUNNING — **3 seeds on the UT server** (`~/furuta_tilt/`, GPU 0/1/2, 8 M steps
+  each, started 2026-06-26). Not yet validated.
+- ⬜ **Phases 2–5** (hardware: LX-16A + BNO086 wiring/firmware, deploy, iterate) — not started.
 
-Repo: branch `foc` (GM3506, torque-source). `main` branch = an earlier *working* build on a
-different motor (Nidec, velocity-source) — useful reference for proven structure/tooling.
+**Immediate next action for the next agent:** monitor/finish the 3 training seeds, pick the best
+`best_model.zip`, judge it against `rl/POLICY_RUBRIC.md` (incl. the **Tilt-project additions**),
+then start Phase 2 hardware.
 
-## Hardware
+---
 
-- **MCU:** ESP32 on **COM5 @ 921600**. Control loop 200 Hz, measured zero jitter.
-- **Driver:** TMC6300, **open-loop FOC, NO current sensing**, ~11 V rail. This is the root of
-  most pain (torque ≈ voltage only approximately; cogging; the FOC offset matters a lot).
-- **Motor:** GM3506, 11 pole pairs, R≈5.6 Ω, Kt≈0.068 (datasheet-confirmed).
-- **Arm encoder:** AS5048A, SPI, 14-bit. **Pendulum encoder:** AS5600, I2C, 12-bit, addr 0x36.
-- **Cable limit:** the arm is limited to ~**±180°** by the **AS5600 cable**. Unplugging the
-  AS5600 frees the arm to spin (used that for decoupled motor-only ID).
+## 1. Project #1 (DONE, deployed) — context you inherit
 
-## Firmware — `firmware/furuta_foc/furuta_foc.ino` (FLASHED, current)
+A self-balancing Furuta pendulum on a **GM3506 gimbal motor**, level ground. Classical LQR failed
+on hardware (pendulum-pivot friction → arm winds to the ±180° cable limit). We trained a **single
+TQC policy** (MuJoCo + domain randomization + curriculum) for swing-up + balance and **deployed it
+on-chip** (ESP32 `MODE_RL`, boot auto-start + auto-recovery). It works on hardware.
 
-Build/flash: `arduino-cli compile --fqbn esp32:esp32:esp32 --upload -p COM5 firmware/furuta_foc`
+- **That project lives in a SEPARATE folder** `c:/Users/thanh/Desktop/LQR_pendulum` (branch `foc`,
+  pushed to `github.com/dat07032002/lqr_pendulum`). **Do not modify it.** This `tilt_pendulum`
+  folder is an independent copy (fresh git repo) seeded from it.
+- Hardware (shared with this project): ESP32 @ COM5/921600, 200 Hz loop; **TMC6300** open-loop FOC
+  (no current sense, ~11 V); **AS5048A** arm encoder (SPI, 14-bit); **AS5600** pendulum encoder
+  (I²C 0x36, 12-bit); arm limited to **±180°** by the AS5600 cable.
+- Measured plant params in `sysid.json`: `alpha=214` (pole), `KM≈0.0127`, `J_arm≈6.84e-5`,
+  arm damping `9.4e-4`/friction `~6e-3`, pole damping `5.06e-5`/friction `0.35e-3`; `+V→+θ̇,+φ̇`.
+- Firmware (`firmware/furuta_foc/furuta_foc.ino`) already has: `MODE_RL` on-chip 2-layer MLP, the
+  `rl` command, boot auto-start (~4 s), auto-recovery (unwind+retry on cable hit), NVS-persisted
+  FOC/AS5600 cal, `log`/`nolog` 200 Hz stream. **This is the level-ground (6-D obs) firmware** — it
+  must be extended to 8-D + IMU for this project (Phase 3).
+- **Key lesson (post-mortem) baked into this project:** a 2nd training attempt (v2) failed not from
+  the reward shaping but from **TQC run-to-run variance + a brittle hard-0.7 curriculum gate that
+  trapped a stalled run** (no seed was set). Fixes carried here: **set a seed, soften the gate to
+  0.6 + a per-stage step-timeout, run multiple seeds and keep the best.**
 
-- **`balanceStep()` observer-order fix** — compute LQR `V` from the current estimate FIRST,
-  then propagate the observer with that `V`. The original order made the combined loop
-  unstable (augmented |eig|≈1.17) even though K and L are each stable. (See `sim.py`.)
-- **Serial 921600.** `log`/`nolog` stream: `log=[t_ms,phi,theta,phi_dot,theta_dot,V,theta_raw]`
-  every tick. Commands: `bal s t<V> k<4> tr<d> hand<d> vlim<V> log nolog raw health
-  calhang calup calfoc clearcal pdf<a> params`.
-- **NVS persistence** (flash): FOC `dir`/`offset` + AS5600 `UPRIGHT_RAW` survive reboot, so
-  it no longer re-sweeps on every boot (cable-safe). `calfoc` re-runs FOC cal, `clearcal` wipes.
-- **FOC calibration = bidirectional sweep** → reliably finds the **symmetric** offset (≈300°).
-  (The old +only sweep landed on asymmetric offsets, e.g. 270° → 2× torque asymmetry.)
-- **Sensors:** I2C 400 kHz, AS5600 slow-filter 2× (CONF SF, ~0.29 ms vs 2.2 ms). **SPI kept at
-  1 MHz** (4 MHz corrupted AS5048A reads). `health` prints STATUS/AGC/MAGNITUDE — both
-  magnets confirmed healthy (so pendulum friction is the bearing, NOT a rubbing magnet).
-- **Velocity filters:** both `phi_dot` and `theta_dot` EMA alpha = **0.5** (≈5 ms lag).
-  `phi_dot` was 0.15 (~28 ms) — lightened (runtime-tunable via `pdf <a>`).
-- **PWM = default (~1 kHz).** ⚠️ Setting 20 kHz **cut torque ~4×** with this high-side-PWM
-  drive scheme — DO NOT re-enable without switching to complementary 6-PWM.
-- **Arm soft-limit ±180°** during balance (re-arms instead of winding the cable).
-- LQR gains in firmware `Kgain={-4.66,-62.35,-1.53,-4.54}` (correct, but balance fails on the
-  friction — that's why we're going RL).
+---
 
-### Firmware gotchas
-- Opening the serial port **resets the ESP32** → it loads cal from NVS (no sweep now) and is
-  ready in ~2–3 s. `config.Link` waits for the banner.
-- **`EncoderServer.exe`** (a separate elevated Windows app) grabs COM5 and **auto-restarts** —
-  you must close it (Task Manager, maybe as admin) before flashing or running serial scripts.
-- After reconnecting the AS5600 / remounting the magnet, re-verify it reads ~±180° at hang
-  (`calhang` if it shifted; `calup` to set true vertical).
+## 2. Project #2 (THIS one) — the tilting base
 
-## System ID — measured values in `sysid.json`
+### 2.1 Why the IMU is needed
+The AS5600 measures the pole **relative to the (now-tilting) base**, so it can't see gravity. If the
+controller balances base-frame "up", under tilt that's *not* true vertical → it holds the pole off
+the zero-torque point → needs continuous torque → **winds the arm** (the original failure mode). So
+the controller must know the board tilt `β` to locate true vertical. → **BNO086 IMU on the board.**
 
-| Quantity | Value | Notes |
-|---|---|---|
-| `alpha` = m·l·g/J_p (pendulum pole) | **214** (period 0.43 s) | validated 3–4×; matches geometry |
-| Pendulum Coulomb `Tf` | **0.35 mN·m** (~2° deadband) | mixed friction |
-| Pendulum viscous | **ζ=0.034**, b_theta=5.06e-5 | viscous-dominant |
-| Arm Coulomb | **~6.5 mN·m** (deadzone ~0.3 V) | coast-down + breakaway |
-| Arm viscous DAMPING | **9.4e-4** | coast-down dω/dt vs ω |
-| Motor `KM` | **0.0127 N·m/V**, J_arm=6.84e-5 | datasheet/geometry |
-| Coupling sign | **+V → +θ̇ and +φ̇** | confirmed; model matches |
-| Latency | 1 control step (5 ms) | zero jitter |
+### 2.2 Hardware decisions (confirmed with user)
+- **Tilt actuator:** Hiwonder **LX-16A** serial bus servo (single-wire half-duplex UART @ 115200,
+  ~17 kg·cm, 6–8.4 V; lib `madhephaestus/lx16a-servo`). **Actuator only** — drives the random ±30°
+  tilt; its pot readback is NOT used (so its noise/backlash don't matter for sensing).
+- **Tilt sensor:** **SparkFun BNO086** IMU (BNO08x family, on-chip fusion). Mounted on the board,
+  one axis = `β`. **Read over I²C @ 200 Hz** (Game Rotation Vector / Gravity — **mag-free**, because
+  the motors disturb the magnetometer). `β̇` from the gyro. Default I²C addr 0x4A/0x4B (coexists with
+  the AS5600 @ 0x36; use the 2nd I²C controller if the bus gets tight). Zero `β` at level on boot.
+  Adafruit **BNO085** is the drop-in alternative.
+- **One ESP32** runs GM3506 FOC + RL + servo command + IMU read.
+- **Keep the ±180° arm cable limit** (deployed-v1 behavior: arm-centering + soft limit + guard).
 
-**KEY findings:**
-1. The original FOC offset was 30° off → **2× direction-asymmetric torque** (would've made
-   balance impossible). Fixed with bidirectional calibration.
-2. **Pendulum-pivot friction is the classical-control killer** — the LQR balances the pole but
-   the arm drifts to the ±180° limit in ~1–2 s (no integral action to fight the friction
-   offset). The RL approach exists specifically to learn a friction-robust nonlinear policy.
-3. Motor electrical params (KM/DAMPING) are **internally inconsistent ~2×** across tests
-   (open-loop FOC nonlinearity) → we **domain-randomize widely** rather than trust one value.
+### 2.3 Observation (8-D) — must match sim ↔ firmware exactly
+```
+[cosθ, sinθ, θ̇/15, clip(φ/π,±2), φ̇/25, prev_action, β/0.6, β̇/3]
+```
+- `θ` = pole from AS5600 (base/board frame — sensor-faithful), `φ` = arm (AS5048A).
+- `β`,`β̇` = board tilt vs gravity (BNO086). The policy infers true-vertical from `θ,φ,β`.
+- Action ∈[-1,1] → ±6 V on the GM3506 (unchanged). Normalizers in `furuta_env.py` (TH_SCALE=15,
+  PHI_SCALE=25, BETA_SCALE=0.6, BETADOT_SCALE=3).
 
-### Hardware ID tools (run on the rig, need COM5 free)
-`config.py` (serial `Link` + `log` parser), `freeswing.py`, `friction_id.py` (interactive,
-self-run: clean releases ~20/35/45°), `actuator_id.py`, `arm_friction_id.py`, `latency_id.py`,
-`sign_check.py`, `check_as5600.py`, `console.py` (interactive serial REPL). `plant_torque.py` /
-`balance_torque.py` / `sim.py` = the torque-model LQR design + closed-loop catch sim.
+### 2.4 Reward (per 200 Hz step) — proven v1 reward, retargeted to TRUE vertical
+```
+up = _true_up()                         # cos of pole angle from GRAVITY vertical (geometric)
+r  = up                                 # main: be upright vs gravity (swing-up + balance)
+   - 0.20*(φ/π)²                        # arm-centering (avoid cable wind)
+   - 0.005*a² - 0.002*φ̇²               # control effort / arm speed (small)
+   - 0.02*(a-prev_a)²                   # CAPS action smoothness (transfers to real motor)
+if up>0.5:  r -= 0.01*θ̇²               # settle: damp pole ONLY near the top (pumping stays free)
+if up>0.92 and |θ̇|<3 and |φ|<90°: r += 2.0   # bonus: genuinely balanced AND arm bounded
+# terminate: |φ|>180° → r-=10 (cable); once up, if up<0 → terminate (anti reward-farm); 10 s limit
+# success (curriculum/eval): up>0.9 & |θ̇|<4 & |φ|<90° held >0.5 s
+```
+`arm_envelope_w=0` (the v2 arm-envelope was exonerated + unnecessary — left as a knob, off). The
+**key change vs project #1**: `up` is geometric **true-vertical** (`_true_up()` from the pole body's
+world orientation), not base-frame `cos(θ)`.
 
-## RL — `rl/`
+### 2.5 Domain randomization (per episode; ON from curriculum stage 1)
+Plant: KM[0.008–0.020], arm damping[3e-4–10e-4], pole damping[2e-5–1e-4], arm friction[4e-3–8e-3],
+pole friction[0.2e-3–0.6e-3], pole inertia ±8%, obs noise[0–0.01], action delay 1–3 steps.
+**Corner-weighted:** `p_corner=0.3` → 30% of draws pushed to a min/max extreme (worst-case coverage).
+Tilt/IMU: tilt amplitude 30–100% of the stage cap, tilt rate β̇ 0.5–2.0 rad/s, IMU β-noise ±0.005 rad,
+IMU rate fixed 200 Hz (`IMU_DECIM=1`).
 
-- **`furuta.xml`** — MuJoCo model from the measured params. Validated by `calibrate_sim.py`
-  (free-swing period/decay, arm coast-down match real within ~10–15%). **Pole joint axis is
-  `-1 0 0`** so the sim's `+V→+θ̇` matches the firmware (sim↔hardware obs/action map 1:1).
-- **`furuta_env.py`** — Gymnasium env. **Obs `[cosθ, sinθ, θ̇/15, φ/π, φ̇/25, prev_action]`**,
-  θ=0 at upright. `prev_action` is included so the memoryless actor can cope with the modeled
-  1–2 step action delay; deployment must use the same 6D input/order. Action ∈[-1,1]→±6 V.
-  EMA filters α=0.5 (match firmware). **No VecNormalize** (obs pre-normalized → simple
-  deployment). `check_env` passes.
-  - **Reward:** `cos(θ)` backbone (swing-up + balance); velocity penalty **gated to the upper
-    half** (don't punish pumping); **+2 bonus AND `is_success` gated on arm `<90°`** (so it
-    can't "succeed" by balancing at the cable edge — kills the arm-drift loophole); CAPS-style
-    action-smoothness `−0.02(Δa)²`; arm-center `−0.2(φ/π)²`; control `−0.005a²`; **−10 +
-    terminate at |φ|>180°** (cable).
-  - **Domain randomization (per episode):** KM[0.008–0.020], arm damping[3e-4–10e-4], arm
-    frictionloss[4e-3–8e-3], pole frictionloss[0.2e-3–0.6e-3], pole damping[2e-5–1e-4],
-    inertia ±8%, obs noise, action latency 1–2 steps.
-- **`train_tqc.py`** — **TQC** (sb3-contrib), actor **[64,64]** (ESP32-portable), critic
-  [256,256], **gSDE by default** (`use_sde`, disabled with `--no_sde`),
-  `gradient_steps=nenv//2`. **5-stage curriculum** (balance ±10° → ±45° → ±90° →
-  near-hanging+assist → full swing-up), advances when rolling success >0.7. EvalCallback saves
-  `models/best_model.zip` by deterministic eval mean reward.
-- **`calibrate_sim.py`** (model validation), **`view.py`** (MuJoCo viewer demo — local only).
+### 2.6 Curriculum (8 stages) — `train_tqc.py` STAGES
+0–4 learn the full task on **level** ground (balance ±10° → ±45° → ±90° → near-hanging+assist →
+full swing-up), then 5–7 ramp tilt in (**±10° → ±20° → ±30°**). Advance when rolling success
+(last 60 eps) **>0.6**, OR after a **700 k-step per-stage timeout** (anti-trap). Reward identical
+across stages. DR off in stage 0 only.
 
-### Why TQC + gSDE + CAPS (researched, peer-reviewed)
-- **CAPS action smoothness** (ICRA 2021) — smooth control transfers far better to real motors
-  (reduces the vibration/limit-cycle we measured). Applied as the `−0.02(Δa)²` reward term.
-- **gSDE** (CoRL 2021, in SB3) — smoother exploration → more deployable policies.
-- Cosine reward + `[cos,sin,θ̇,φ,φ̇]` obs are the validated standard for Furuta RL; this env adds
-  `prev_action` as a practical delay-compensation input.
-- TQC ≈ SAC for this small task but a free upgrade (only the actor is deployed, so no ESP32 cost).
+---
 
-## Training server (UT)
+## 3. Files (all under `tilt_pendulum/`)
 
-- `ssh -i ~/.ssh/aere_codex_ed25519 tn22833@aere-a83514.ae.utexas.edu` — **requires UT VPN**
-  (hostname won't resolve otherwise). Key already authorized.
-- **5× RTX 6000 Ada (48 GB), 256 cores, no SLURM.** Be a good citizen: use **one GPU**
-  (`CUDA_VISIBLE_DEVICES=0`), modest `nenv`; it's shared.
-- Our project: **`~/furuta_rl/`** (venv `.venv`, code in `rl/`, logs `train.log`). **Do NOT
-  touch `~/pendulum/`** — that's prior PPO work from a different session.
-- **Env gotcha:** the driver is CUDA 12.7, so torch must be a **cu124** build (`pip install
-  torch --index-url https://download.pytorch.org/whl/cu124`); `tensorboard` must be installed.
-- Launch example: `cd ~/furuta_rl && CUDA_VISIBLE_DEVICES=0 nohup ./.venv/bin/python
-  rl/train_tqc.py --steps 5000000 --nenv 16 --tag fix_sde > train_fix_sde.log 2>&1 &`.
-  Monitor: `grep curriculum train_fix_sde.log`,
-  `grep -E 'success_rate|ep_rew_mean' train_fix_sde.log | tail`.
+| File | Role |
+|---|---|
+| `rl/furuta.xml` | MuJoCo model: **board (tilt) hinge about y** at the stand base + stiff position actuator tracking β_ref; floor/bearings/**yellow tilt-axis marker**/tan platform (visuals). Furuta params from sysid. |
+| `rl/tilt.py` | bounded tilt generator: `triangle` (sweep) + `random` (training), `β̇` rate-capped. Shared sim↔firmware. |
+| `rl/furuta_env.py` | 8-D Gym env: drives tilt each step, models BNO086 read (200 Hz + noise), `_true_up()` reward, tilt DR + curriculum knobs (`tilt_amp`, `tilt_betadot_max`). |
+| `rl/train_tqc.py` | TQC training: 8-stage curriculum, soft-0.6 gate + timeout, `--seed`, checkpointing, EvalCallback→`best_model.zip`. |
+| `rl/export_policy.py` | actor → `policy_weights.h` (**auto-detects obs dim**; verifies vs SB3 <1e-6; replicates gSDE `clip_mean`). |
+| `rl/feasibility_tilt.py` | Phase-0 hand-LQR feasibility sweep (true-vertical FF, tilt rate × arm-orientation). |
+| `rl/view_tilt.py` | interactive viewer (LQR balancing or `--nopolicy` raw physics; `--phi0/--theta0/--betadot/--mode`). |
+| `rl/POLICY_RUBRIC.md` | acceptance rubric + **Tilt-project additions** (Pass 1-T/3-T/4-T/5-T). |
+| `firmware/furuta_foc/` | project-#1 firmware (6-D `MODE_RL`). **Phase 3 must extend to 8-D + IMU.** |
+| `sysid.json`, `config.py`, `pc_balance.py`, `step_response.py`, ID tools | inherited from project #1. |
 
-## CURRENT STATE (in progress)
+---
 
-- **Two TQC A/B runs are live on the UT server** (`~/furuta_rl/`, 5M target, `nenv=16`):
-  - `fix_sde` (PID 2391852): `./.venv/bin/python rl/train_tqc.py --steps 5000000 --nenv 16
-    --tag fix_sde`
-  - `fix_nosde` (PID 2344750): `./.venv/bin/python rl/train_tqc.py --steps 5000000 --nenv 16
-    --no_sde --tag fix_nosde`
-- Both reached **stage 4 = full swing-up**. The theoretical max episode return is ~**6000**
-  (`3.0` reward/step × 2000 steps).
-- Latest check (2026-06-24 19:34 CDT):
-  - `fix_sde`: ~848k steps, rollout reward ~1.6k, rollout success ~0.42. It previously looked
-    much better around 600–760k steps (rollout reward ~4.8k, success ~0.89; deterministic eval
-    at 740k: reward ~4.13k, success 80%) but has since regressed. **Use best_model/eval
-    artifacts, not simply the final checkpoint. Watch for instability.**
-  - `fix_nosde`: ~1.09M steps, rollout reward ~0.55–0.61k, rollout success ~0.32–0.34; latest
-    deterministic eval at 1.08M: reward ~986, success 50%. It is generally weaker and more
-    inconsistent than SDE.
-- Earlier local run revealed the **arm-drift loophole** (policy balanced but arm wound to
-  limit); fixed by gating bonus/success on arm<90°. That fix is in the current env.
+## 4. Training run (in progress) — UT server
 
-### Validation snapshot — `rl/models/fix_sde/best_model.zip`
+- `ssh -i ~/.ssh/aere_codex_ed25519 tn22833@aere-a83514.ae.utexas.edu` (needs **UT VPN**).
+- Project dir **`~/furuta_tilt/`** (code in `rl/`). **Reuses `~/furuta_rl/.venv`** (torch cu124 +
+  sb3-contrib + mujoco) — do NOT touch `~/furuta_rl/` or `~/pendulum/`.
+- 3 runs: `tilt_s0/s1/s2` (GPU 0/1/2), `--steps 8000000 --nenv 16 --seed {0,1,2} --tag tilt_s{n}`,
+  logs `train_tilt_s{n}.log`, models `rl/models/tilt_s{n}/best_model.zip` (+ `ckpt_*`).
+- Monitor: `grep -E 'curriculum|success_rate|ep_rew_mean' train_tilt_s0.log | tail`.
+- Launch cmd (for reference / relaunch):
+  `cd ~/furuta_tilt && CUDA_VISIBLE_DEVICES=0 nohup ~/furuta_rl/.venv/bin/python rl/train_tqc.py
+  --steps 8000000 --nenv 16 --seed 0 --tag tilt_s0 > train_tilt_s0.log 2>&1 &`
 
-Validated on the server 2026-06-24 19:xx CDT with deterministic actions, full swing-up initial
-conditions, 10 s episodes:
+**Selection:** pull each seed's `best_model.zip`, evaluate under random ±30° tilt + plant DR
+(deterministic), **keep the best**, judge vs `POLICY_RUBRIC.md` (Tilt additions). Watch the
+curriculum reach stage 7 and stage-7 success climb >0.6.
 
-- **Nominal/no-DR:** 20/20 success, mean reward **5055/6000**, full 2000-step episodes,
-  saturation ≈0%, smooth actions (`mean|Δa|≈0.02`). Good.
-- **Random DR:** 100 episodes, **88% success**, mean reward **4452/6000**, median reward 5157,
-  but 12 failures and some high-action episodes (`p90` saturation ≈32%). This clears the
-  rubric's ≥80% randomized-DR success bar, but with visible tail risk.
-- **Corner sweep** over low/high KM, arm friction, pole friction, and 1/2-step delay: **11/16
-  success = 68.8%**, mean reward 3751. This does **not** pass worst-case robustness.
-  Worst failures cluster around high KM + 2-step delay and one low-KM/low-arm-friction/high-pole-
-  friction case.
-- **Arm margin warning:** even successful nominal/random runs often used arm excursions above the
-  90° success/bonus gate (nominal mean max |φ|≈110°, random mean max |φ|≈112°, worst random hit
-  the ±180° cable limit). It can succeed, but not yet with comfortable cable margin.
+---
 
-Verdict: `fix_sde/best_model.zip` is the best candidate so far and is **sim-good on average DR**,
-but **not deploy-ready** until it passes a harder worst-case sweep and shows better arm/cable
-margin. Consider adding checkpoint validation, stronger arm-margin shaping, or narrower/safer
-hardware initial tests before PC-in-loop.
+## 5. Phase-0 feasibility findings (sim, hand-LQR, no policy)
 
-### Validation snapshot — `rl/models/fix_nosde/best_model.zip`
+`python rl/feasibility_tilt.py`. ±30° tilt is **physically feasible on ±6 V**, but **orientation-
+dependent**: at arm φ≈0 the swing plane is ⊥ the tilt axis → tilt barely disturbs the pole (pole
+geometrically capped ~30° from vertical there, but stable); at **φ≈90° the tilt maximally drives the
+pole** (the hard case). The linear LQR holds all orientations *moving* to ~2 rad/s and is marginal
+on a sustained 30° hold at φ=90° (a linear-controller limit, not an authority wall). → **set
+β̇_max≈2 rad/s** for training; RL (nonlinear + free to orient the arm) should match/exceed it.
+**Tip:** physically orienting the rig so the arm's rest/center is near the benign φ=0 makes balance
+easier, but the policy must still handle transits through φ=90°.
 
-Same deterministic validation battery, full swing-up initial conditions, 10 s episodes:
+---
 
-- **Nominal/no-DR:** 19/20 success, mean reward **5185/6000**, smooth and essentially no
-  saturation. One early failure; successful cases often looked very good.
-- **Random DR:** 100 episodes, **74% success**, mean reward **3846/6000**, median reward 5117,
-  26 failures. This **does not pass** the rubric's ≥80% randomized-DR success bar.
-- **Corner sweep:** 12/16 success = **75%**, mean reward 2668. Slightly higher corner success
-  count than SDE in this small grid, but much lower reward/episode length and still not
-  worst-case robust. Delay=2 is a recurring failure mode.
-- **Arm margin warning:** similar cable-margin issue as SDE. Random max |φ| mean ≈112.5° and
-  worst cases hit/exceeded the ±180° cable limit.
+## 6. Phases 2–5 (hardware) — not started
 
-Comparison: `fix_sde/best_model.zip` is still the preferred candidate because it passes average
-randomized DR (88% vs 74%) and has higher mean reward. `fix_nosde` is smoother/less saturated in
-some nominal cases but less robust across randomized DR. Neither is deploy-ready because both
-fail worst-case robustness and both use too much arm travel.
+- **Phase 2 — tilt subsystem:** mount rig on the board; LX-16A drives random ±30° (port `tilt.py`,
+  cap β̇_max). Mount BNO086, read `β`/`β̇` over I²C @ 200 Hz (mag-free). Gate: smooth tilt; IMU β
+  matches a protractor, low-noise.
+- **Phase 3 — obs integration:** extend firmware `MODE_RL` to **8-D** (+β,β̇), keep the ±160° arm
+  guard + auto-recovery. **Sign/scale check** at PC-in-loop: `+β` firmware = `+β` sim (β norm 0.6),
+  plus the inherited `sinθ`/`θ̇`/action sign checks. Re-export `policy_weights.h` (8-D, verify <1e-6).
+- **Phase 4 — deploy & staged test:** static tilt ±10/20/30° → slow random → full random ±30°.
+- **Phase 5 — iterate:** log real `β/θ` + response, re-tune sim/DR, retrain.
 
-### Fast swing-up realism ablation — `fix_sde/best_model.zip`
+---
 
-Ran read-only ablation tests after the GIF looked suspiciously fast. Baseline deterministic rollout
-from hard full-swing-up starts (`θ0 = ±180°, ±150°, ±120°`) catches upright extremely quickly:
-median first upright ≈ **0.23 s**, median first 0.5 s stable streak ≈ **0.29 s**, mean max arm
-travel ≈ **115°**, max ≈ **133°**.
+## 7. Decisions / gotchas / open items
 
-Key ablation results:
+- **IMU read = mag-free fusion** (Game Rotation Vector / Gravity), NOT the mag-based Rotation Vector
+  (motors disturb the magnetometer).
+- **IMU @ 200 Hz over I²C** is assumed (`IMU_DECIM=1`). If hardware can't sustain it, fall back to
+  UART-RVC 100 Hz and retrain with `IMU_DECIM=2` (env knob).
+- **Servo sag does NOT corrupt β** — the IMU reads the *actual* board angle; sag only makes the tilt
+  motion noisier/laggier.
+- **Adaptive quantile dropping** was considered and **deferred** — not our bottleneck; keep fixed
+  `top_quantiles_to_drop_per_net=2`. If overestimation instability appears, sweep the fixed value
+  (3/5) before anything custom.
+- **Tilt axis vs pole hinge geometry:** y-tilt × pole-hinge gives the φ-dependent coupling
+  (`~cos`/`sin(φ−φ_axis)`); this is why `φ` (via `φ/π`) is in the obs — the policy needs arm
+  orientation to know how the tilt projects onto the pole. Verified in the viewer.
+- **Open:** confirm the LX-16A torque holds the actual board+rig without sag; confirm BNO086 200 Hz
+  on the shared I²C bus; one-ESP32 200 Hz timing budget (FOC + servo + IMU + MLP) — split to the 2nd
+  core if needed.
 
-- **Actuator dynamics are the biggest realism suspect.**
-  - Baseline: **100%** success.
-  - Add 20 ms first-order motor lag: **33%** success.
-  - Add 50 ms or 100 ms lag: **0%** success.
-  - Add voltage slew limits of 40/20/10 V/s: **0%** success.
-  - Interpretation: the policy relies on near-instant, clean torque. Real open-loop FOC voltage
-    control will likely be slower/nonlinear.
-- **Arm envelope is too permissive.**
-  - Hard arm stop at ±150°: **100%** success.
-  - Hard arm stop at ±120°: **50%** success.
-  - Hard arm stop at ±90°: **0%** success.
-  - Interpretation: the policy is not a polite ±90° swing-up; it uses the arm as a big flywheel.
-- **Motor authority matters.**
-  - Corrected KM scaling: KM×1.00 → **100%**, KM×0.75 → **17%**, KM×0.50 → **83%** but slower/
-    near cable limit, KM×0.35 and below → **0%**.
-  - Interpretation: if real effective torque is lower than sim, the fast swing-up will not transfer.
-- **Voltage cap matters less than lag/slew.**
-  - Clamp to ±4 V or ±3 V: **100%** success but slower catch.
-  - Clamp to ±2 V: **50%** success.
-  - Interpretation: the issue is not just high voltage; it is ideal instantaneous torque.
-- **Deadzone sensitivity.**
-  - 0.3 V deadzone: **100%** success.
-  - 0.6 V deadzone: **50%** success.
-  - 1.0 V deadzone: **17%** success.
-- **Reward is too forgiving of wide/fast swing-up.**
-  - Counterfactual rescoring with stronger arm penalty / soft >90° penalty only modestly reduces
-    the baseline rollout score. Current reward mainly pays for early upright time.
-- **Hand-coded `feasibility.py` sanity check:** energy-pump + LQR can fling the pole upright
-  quickly in the same MuJoCo model, though it does not hold. This supports the idea that the model
-  permits aggressive energy injection.
+---
 
-Narrowed diagnosis: **primary causes = ideal/instant actuator model + weak arm-envelope shaping**;
-secondary causes = motor-gain sensitivity + reward overvaluing early upright time. SDE itself is
-not the main culprit. The balance behavior is more believable than the swing-up. Next training
-iteration should add actuator lag/slew/deadzone/back-EMF-ish effects and enforce a safer arm
-envelope (e.g. strong penalty past 90°, hard/soft limit before 120°) before hardware swing-up.
+## 8. Git
 
-> **NOTE:** the snapshot above (regression/realism worries) is the *pre-deployment* analysis.
-> It was largely resolved by what follows. In particular the swing-up **did transfer** — the
-> lag/slew ablations were pessimistic (the step-test below measured the real lag at ~15 ms,
-> already modeled). Keep the analysis for context, but the on-chip result is the ground truth.
-
-## Step 1 — actuator step-test (settled the "fast swing-up unrealistic?" worry)
-
-`step_response.py` (drives the arm, ±3 V step ×3): **real response = dead 15 ms, τ 10 ms**, very
-consistent. Running the *same* step in sim gives the **same 15 ms dead time** (the modeled 1-step
-delay + α=0.5 EMA filter reproduce it). So there is **no large unmodeled lag** → the ablation's
-20–50 ms lag and 40 V/s slew scenarios were worse-than-reality (a PWM driver slews far faster).
-The real transfer risks were KM-sensitivity + arm-flywheel, not lag — addressed by the hardening.
-
-## Env hardening (this session, in `rl/furuta_env.py`)
-
-- **Arm-envelope shaping:** added `−0.5·max(0,|φ|−90°)²` so the policy can't use the arm as a
-  180° flywheel (kills the cable risk; balanced reward now +3 centered → −0.4 at 180°).
-- **Corner-weighted DR:** `p_corner=0.3` — 30% of DR draws are pushed to a min/max extreme so
-  worst-case corners (the failed corner-sweep cells) are actually trained, not just the center.
-- **Response-time DR:** action delay widened 1–2 → **1–3 steps**.
-- `train_tqc.py`: added `CheckpointCallback` (periodic `ckpt_*.zip`) to recover the peak if a run
-  regresses. The v2 retrain (`v2_sde` GPU2, `v2_nosde` GPU3) uses this hardened env.
-
-## On-chip deployment (`MODE_RL`) — the working path
-
-- **`rl/export_policy.py`** dumps the actor MLP (`6→64→64→1`, ReLU, **tanh(clip(mu,±2))**) to
-  `rl/policy_weights.h` and verifies the numpy forward matches SB3 to <1e-6, then it's copied to
-  `firmware/furuta_foc/policy_weights.h`.
-  - **GOTCHA (cost an hour):** gSDE actors have `clip_mean=2.0` → `mu = Hardtanh(±2)` before tanh.
-    Miss it and the export only diverges at action saturation. The C forward replicates the clip
-    (`RL_CLIP_MEAN`). `pc_balance.py` was fine because it calls `policy.predict` (clip is internal).
-  - Also: SB3 `predict` on **CUDA** differs from CPU by ~0.03 at saturation (matmul order); verify
-    the export on **CPU** (`TQC.load(..., device="cpu")`), which is the ESP32's float32 path.
-- **Firmware `MODE_RL`** (`rlForward` + `rlStep`, `rl` command): builds obs
-  `[cosθ,sinθ,θ̇/15,clip(φ/π,±2),φ̇/25,prev_action]` from the same sensors, runs the MLP at 200 Hz,
-  `V=6·action` (clipped to `vlim`). `rl` recenters the arm (`rl_phi_ref=phi_full`) at engage so
-  arm-centering matches the sim. Cable guard at ±160°. C-indexed forward verified vs SB3 to 6.6e-7.
-- **`pc_balance.py`** (PC-in-loop, `--dry` sign-check / live with `--sflip_*`, `--vlim`): used to
-  confirm sign alignment + first balance before going on-chip. Kept for future PC-in-loop tests.
-
-**Test recipe:** `console.py` → confirm `raw` th≈0 at upright (`calup` if not) → `vlim 5` → hold
-rod upright → `rl` → `s` to stop. (PC-in-loop equivalent: `python pc_balance.py --vlim N`.)
-
-## NEXT STEPS (goal met; these are polish/robustness)
-
-1. **Pull the v2 model when the retrains finish** (`v2_sde`/`v2_nosde` on the UT server, hardened
-   env). Re-export + flash; it should be *gentler* (arm-envelope) and more corner-robust than the
-   deployed `fix_sde`. Select by `best_model.zip`/checkpoints, not final reward.
-2. **Quantify on hardware:** swing-up success rate over N trials, disturbance-rejection limit,
-   steady-state arm drift, action smoothness/buzz at `vlim 5` vs `vlim 6`. Judge vs
-   `rl/POLICY_RUBRIC.md`.
-3. **Tune if needed:** if buzzy → CAPS weight up / retrain; if arm drifts → arm-center weight up.
-4. **Robustness/iterate (`Step 9`):** if v2 underperforms, re-tune sim friction from fresh `log=`
-   data, widen DR, retrain. Server runs/logs in `~/furuta_rl/`.
-
-## Open design questions
-- Arm success/bonus gate at **90°** (margin from the 180° cable). Could relax to 120° if
-  swing-up+recenter is too hard. (User aware; default 90°.)
-- 5M steps may not be enough for full swing-up within ±180°/±6 V — extend if stage 4 stalls.
-  If swing-up is infeasible at the low-KM end of the DR range, that's a real authority finding
-  (need more arm travel or voltage, or accept balance-only + manual lift).
+Fresh repo in `tilt_pendulum/`. Commits: `9a234a2` seed · `d298041` Phase 0 · `6531f7e` viewer/base ·
+`c02d5bc` Phase 1 env+train · `965c740` IMU 200 Hz. **No remote yet** (local only; `git push` not
+run — ask the user before pushing).
