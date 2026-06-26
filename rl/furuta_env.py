@@ -75,6 +75,8 @@ class FurutaEnv(gym.Env):
         self.init_vel_assist = 0.0
         self.p_corner = 0.3              # fraction of DR draws pushed to a min/max extreme
         self.arm_envelope_w = 0.0        # >90deg arm penalty (0 = deployed-v1 behavior; off here)
+        self.arm_center_w = 0.20         # arm-centering (phi/pi)^2 weight; LOWER it to allow the
+                                         # arm to pump for swing-up (0.20 strangled it; ~0.02 frees it)
         self.arm_limit = ARM_LIMIT       # hard cable limit [rad]; set None to free the arm (diag)
         # tilt curriculum (set externally): max board-tilt amplitude this stage (0 = level ground)
         self.tilt_amp = 0.0
@@ -211,7 +213,7 @@ class FurutaEnv(gym.Env):
         up = self._true_up()                                 # +1 true-vertical, -1 inverted (gravity)
         # arm-centering weight raised 0.03->0.2: the policy MUST keep the arm from winding to
         # the +-180 limit (the LQR's failure mode, which the sim reproduced).
-        r = up - 0.20 * (phi / np.pi)**2 - 0.005 * a**2 - 0.002 * phid**2
+        r = up - self.arm_center_w * (phi / np.pi)**2 - 0.005 * a**2 - 0.002 * phid**2
         r -= 0.02 * (a - self.prev_action)**2               # mild smoothness (don't block corrective wiggle)
         # steep arm-envelope past 90 deg: discourage using the arm as a 180-deg flywheel
         # (the realism/cable risk seen in eval). Still allows transient pumping near 90-120 deg.

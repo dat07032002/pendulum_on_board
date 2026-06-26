@@ -132,7 +132,8 @@ def main():
     ap.add_argument("--start_stage", type=int, default=0)   # Phase B: resume curriculum at this stage
     ap.add_argument("--max_stage", type=int, default=None)  # last stage to reach (no_dr -> 4)
     ap.add_argument("--free_arm", action="store_true")      # remove +-180 cable limit (ceiling probe)
-    args = ap.parse_args()
+    ap.add_argument("--arm_center_w", type=float, default=0.20)  # arm-centering weight; LOW (~0.02)
+    args = ap.parse_args()                                       # frees the arm to pump for swing-up
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
     max_stage = args.max_stage if args.max_stage is not None else (4 if args.no_dr else len(STAGES) - 1)
@@ -147,6 +148,8 @@ def main():
                           info_keywords=("is_success",))
     eval_env.set_attr("init_angle_max", np.pi)
     eval_env.set_attr("tilt_amp", float(np.deg2rad(0.0 if args.no_dr else args.eval_tilt_deg)))
+    venv.set_attr("arm_center_w", args.arm_center_w)
+    eval_env.set_attr("arm_center_w", args.arm_center_w)
 
     model = TQC(
         "MlpPolicy", venv,
