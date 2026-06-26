@@ -3,6 +3,13 @@ train_tqc.py — Step 5: train a TQC policy for Furuta swing-up + balance, with 
 
   python rl/train_tqc.py [--steps 2000000] [--nenv 8]
 
+IMPORTANT — use nenv=8 (NOT 16). Confirmed twice (v2 post-mortem + a 2026-06-26 stage-0 bisect):
+at the same step budget nenv=8 learns markedly faster/more stably. `gradient_steps=max(4,nenv//2)`
+means nenv=16 does 8 consecutive updates on a staler buffer snapshot vs 4 at nenv=8 (same 0.5
+updates/sample, but bigger/staler blocks -> worse sample efficiency per env-step). Higher nenv is
+faster wall-clock data collection but the wrong trade for this small task. (Off-policy quirk: the
+PPO "more envs = better" intuition fails because gradient_steps scales with nenv.)
+
 Curriculum (advances when rolling success rate > 0.7): start balancing near upright, then
 widen the initial tilt, then add energy-pumping from near hanging, then full swing-up from
 rest. Domain randomization is on from stage 1 onward (stage 0 near-nominal so balance is

@@ -187,6 +187,16 @@ easier, but the policy must still handle transits through φ=90°.
   UART-RVC 100 Hz and retrain with `IMU_DECIM=2` (env knob).
 - **Servo sag does NOT corrupt β** — the IMU reads the *actual* board angle; sag only makes the tilt
   motion noisier/laggier.
+- **USE `nenv=8`, NOT 16 (sample efficiency).** Confirmed twice (v2 post-mortem + the 2026-06-26
+  stage-0 bisect): at the same *step* budget, nenv=8 learns markedly faster/more stably than nenv=16
+  here. Why: `train_tqc.py` sets `gradient_steps = max(4, nenv//2)`, so nenv=16 does **8 gradient
+  updates in a row on the same (staler) buffer snapshot** before refreshing data, vs 4 at nenv=8 —
+  same updates/sample ratio (0.5) but bigger, staler update blocks → less effective *per env-step*,
+  and learning is diluted over more steps per improvement cycle. nenv=16 is faster *wall-clock* data
+  collection but worse *sample efficiency* — wrong trade for this small task. (Off-policy quirk: the
+  PPO intuition "more envs = better" does NOT apply because `gradient_steps` scales with nenv. A
+  cleaner future fix is to **decouple** them — fix `gradient_steps` independent of nenv.) Evidence:
+  tilt env stage-0 reached 0.41@80k at nenv=8 (== project #1's 0.43) but only 0.28@400k at nenv=16.
 - **Adaptive quantile dropping** was considered and **deferred** — not our bottleneck; keep fixed
   `top_quantiles_to_drop_per_net=2`. If overestimation instability appears, sweep the fixed value
   (3/5) before anything custom.
