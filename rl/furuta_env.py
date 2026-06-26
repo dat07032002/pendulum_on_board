@@ -16,6 +16,7 @@ init_angle_max / init_vel_assist (see train_tqc.py).
 from __future__ import annotations
 
 import os
+import sys
 
 import numpy as np
 import gymnasium as gym
@@ -23,11 +24,17 @@ from gymnasium import spaces
 import mujoco
 
 HERE = os.path.dirname(__file__)
+sys.path.insert(0, HERE)
+from tilt import TiltGenerator  # noqa: E402
+
 V_MAX = 6.0
 DT = 0.005
 TH_SCALE = 15.0      # rad/s normalizers
 PHI_SCALE = 25.0
+BETA_SCALE = 0.6     # board-tilt normalizer (~just above +-30 deg = 0.52 rad)
+BETADOT_SCALE = 3.0  # board-tilt-rate normalizer
 ARM_LIMIT = np.pi    # +-180 deg
+IMU_DECIM = 2        # BNO086 fusion ~100 Hz -> update beta every 2 ticks (200 Hz loop)
 
 
 class FurutaEnv(gym.Env):
@@ -45,8 +52,13 @@ class FurutaEnv(gym.Env):
 
         jp = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "pole")
         ja = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "arm")
+        jt = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "tilt")
         self.qadr_p, self.qadr_a = self.model.jnt_qposadr[jp], self.model.jnt_qposadr[ja]
         self.dadr_p, self.dadr_a = self.model.jnt_dofadr[jp], self.model.jnt_dofadr[ja]
+        self.qadr_t, self.dadr_t = self.model.jnt_qposadr[jt], self.model.jnt_dofadr[jt]
+        self.act_motor = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "motor")
+        self.act_tilt = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "tilt")
+        self.bid_pole = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "pole")
 
         # nominal params (randomize relative to these)
         self.nom = dict(
@@ -62,11 +74,16 @@ class FurutaEnv(gym.Env):
         self.init_angle_max = np.pi      # default: full swing-up from hanging
         self.init_vel_assist = 0.0
         self.p_corner = 0.3              # fraction of DR draws pushed to a min/max extreme
-        self.arm_envelope_w = 0.5        # weight of the >90deg arm penalty (0 = off, v1 behavior)
+        self.arm_envelope_w = 0.0        # >90deg arm penalty (0 = deployed-v1 behavior; off here)
+        # tilt curriculum (set externally): max board-tilt amplitude this stage (0 = level ground)
+        self.tilt_amp = 0.0
+        self.tilt_betadot_max = 2.0      # cap on random tilt rate [rad/s] (Phase-0 feasible bound)
+        self.beta_noise = 0.005          # IMU fusion noise on beta [rad] (~0.3 deg)
 
         self.action_space = spaces.Box(-1.0, 1.0, (1,), np.float32)
-        # obs includes prev_action (6th) so the memoryless policy can handle the action delay
-        self.observation_space = spaces.Box(-np.inf, np.inf, (6,), np.float32)
+        # obs (8): [cos th, sin th, thd/15, phi/pi, phid/25, prev_action, beta/0.6, betad/3]
+        # theta/phi are base-frame (AS5600/AS5048A); beta/betad = board tilt vs gravity (BNO086 IMU).
+        self.observation_space = spaces.Box(-np.inf, np.inf, (8,), np.float32)
 
     # ---- domain randomization ----
     def _randomize(self):
@@ -122,11 +139,30 @@ class FurutaEnv(gym.Env):
         self._best_up_streak = 0
         self._was_up = False
         self.act_buf = [0.0] * self._delay
+
+        # tilt: per-episode random board motion (None = level ground). Amplitude + rate randomized
+        # up to the curriculum's tilt_amp / betadot cap. Driven each step via the position actuator.
+        if self.tilt_amp > 1e-4 and self.randomize:
+            amp = rng.uniform(0.3, 1.0) * self.tilt_amp
+            rate = rng.uniform(0.5, self.tilt_betadot_max)
+            self.tilt_gen = TiltGenerator(beta_max=amp, betadot_max=rate, dt=DT,
+                                          mode="random", rng=rng)
+        else:
+            self.tilt_gen = None
+        self._beta_meas = 0.0      # IMU-measured board tilt (BNO086, ~100 Hz, held between updates)
+        self._betad_meas = 0.0
+        self._imu_ctr = 0
         return self._obs(), {}
+
+    def _true_up(self):
+        """cos of the pole's tilt from TRUE (gravity) vertical (+1 up). Frame-independent — this is
+        the real balance objective once the base tilts (base-frame 'up' != gravity 'up')."""
+        pole_dir = self.data.xmat[self.bid_pole].reshape(3, 3) @ np.array([0.0, 0.0, -1.0])
+        return float(pole_dir[2])
 
     def _obs(self):
         q = self.data.qpos[self.qadr_p]
-        th_up = q - np.pi                                    # 0 at upright
+        th_up = q - np.pi                                    # 0 at upright (base/board frame, AS5600)
         phi = self.data.qpos[self.qadr_a]
         n = self._obs_noise * self.np_random.standard_normal(2)
         o = np.array([
@@ -136,6 +172,8 @@ class FurutaEnv(gym.Env):
             np.clip(phi / np.pi, -2, 2),
             self.phid_f / PHI_SCALE + n[1],
             self.prev_action,                                # in-flight action (handles delay)
+            np.clip(self._beta_meas / BETA_SCALE, -2, 2),    # board tilt (BNO086 IMU vs gravity)
+            self._betad_meas / BETADOT_SCALE,                # board tilt rate (IMU gyro)
         ], dtype=np.float32)
         return o
 
@@ -143,12 +181,22 @@ class FurutaEnv(gym.Env):
         a = float(np.clip(action[0], -1, 1))
         self.act_buf.append(a)
         a_eff = self.act_buf.pop(0)                          # delayed action
-        self.data.ctrl[0] = a_eff * V_MAX
+        self.data.ctrl[self.act_motor] = a_eff * V_MAX
+        # drive the board tilt: the servo (position actuator) tracks beta_ref(t)
+        beta_ref = self.tilt_gen.step() if self.tilt_gen is not None else 0.0
+        self.data.ctrl[self.act_tilt] = beta_ref
         for _ in range(self.sub):
             mujoco.mj_step(self.model, self.data)
         # EMA-filter velocities (match firmware alpha=0.5)
         self.thd_f = 0.5 * self.thd_f + 0.5 * self.data.qvel[self.dadr_p]
         self.phid_f = 0.5 * self.phid_f + 0.5 * self.data.qvel[self.dadr_a]
+        # BNO086 IMU read of board tilt: ~100 Hz fusion -> refresh every IMU_DECIM ticks (+ noise)
+        self._imu_ctr += 1
+        if self._imu_ctr >= IMU_DECIM:
+            self._imu_ctr = 0
+            nb = self.beta_noise * self.np_random.standard_normal() if self.randomize else 0.0
+            self._beta_meas = float(self.data.qpos[self.qadr_t]) + nb
+            self._betad_meas = float(self.data.qvel[self.dadr_t])
 
         q = self.data.qpos[self.qadr_p]
         th_up = (q - np.pi + np.pi) % (2 * np.pi) - np.pi
@@ -159,7 +207,7 @@ class FurutaEnv(gym.Env):
         # reward: cos(theta) drives swing-up AND balance; the velocity penalty is GATED to
         # the upper half so it doesn't discourage the pumping that swing-up needs, plus a
         # strong bonus for the actual balanced state.
-        up = np.cos(th_up)                                   # +1 upright, -1 hanging
+        up = self._true_up()                                 # +1 true-vertical, -1 inverted (gravity)
         # arm-centering weight raised 0.03->0.2: the policy MUST keep the arm from winding to
         # the +-180 limit (the LQR's failure mode, which the sim reproduced).
         r = up - 0.20 * (phi / np.pi)**2 - 0.005 * a**2 - 0.002 * phid**2

@@ -24,11 +24,20 @@ def main():
     ap.add_argument("--betadot", type=float, default=1.0, help="tilt rate cap [rad/s]")
     ap.add_argument("--mode", default="random", choices=["random", "triangle"])
     ap.add_argument("--nopolicy", action="store_true", help="no balance control (raw physics)")
+    ap.add_argument("--theta0", type=float, default=None,
+                    help="initial pole angle from upright [deg] (0=upright, 180=hanging)")
+    ap.add_argument("--phi0", type=float, default=None, help="initial arm angle [deg]")
     args = ap.parse_args()
+
+    # raw-physics default: hanging pole at phi=90 (where the y-tilt strongly drives it) so motion
+    # is obvious. NOTE: at phi=0 the tilt is perpendicular to the swing plane -> nothing moves.
+    theta0 = args.theta0 if args.theta0 is not None else (180.0 if args.nopolicy else 0.0)
+    phi0 = args.phi0 if args.phi0 is not None else (90.0 if args.nopolicy else 0.0)
 
     M, D, K = F.M, F.D, F.K
     mujoco.mj_resetData(M, D)
-    D.qpos[F.PQ] = np.pi                       # pole upright
+    D.qpos[F.PQ] = np.pi - np.deg2rad(theta0)  # pole: pi=upright, 0=hanging
+    D.qpos[F.AQ] = np.deg2rad(phi0)            # arm orientation
     mujoco.mj_forward(M, D)
     gen = TiltGenerator(beta_max=np.deg2rad(30.0), betadot_max=args.betadot, dt=F.DT,
                         mode=args.mode, rng=np.random.default_rng(0))

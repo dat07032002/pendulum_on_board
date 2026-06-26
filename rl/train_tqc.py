@@ -27,13 +27,17 @@ from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, Check
 
 HERE = os.path.dirname(__file__)
 
-# (init_angle_max [rad], init_vel_assist, randomize)
+# (init_angle_max [rad], init_vel_assist, randomize, tilt_amp_deg)
+# Stages 0-4 learn the full task on LEVEL ground (as deployed v1), then 5-7 ramp the board tilt in.
 STAGES = [
-    (0.17, 0.0, False),   # 0: balance, ~10 deg, near nominal
-    (0.79, 0.0, True),    # 1: catch from ~45 deg + DR
-    (1.57, 0.0, True),    # 2: ~90 deg
-    (2.60, 1.5, True),    # 3: near hanging + energy-pump assist
-    (np.pi, 0.0, True),   # 4: full swing-up from rest
+    (0.17,  0.0, False, 0),    # 0: balance ~10 deg, level, near-nominal
+    (0.79,  0.0, True,  0),    # 1: catch ~45 deg + DR, level
+    (1.57,  0.0, True,  0),    # 2: ~90 deg, level
+    (2.60,  1.5, True,  0),    # 3: near hanging + energy-pump assist, level
+    (np.pi, 0.0, True,  0),    # 4: full swing-up from rest, level
+    (np.pi, 0.0, True,  10),   # 5: full task + gentle +-10 deg random tilt
+    (np.pi, 0.0, True,  20),   # 6: + moderate +-20 deg tilt
+    (np.pi, 0.0, True,  30),   # 7: + full +-30 deg random tilt (target)
 ]
 
 
@@ -44,21 +48,32 @@ def make_env(randomize=True):
 
 
 class Curriculum(BaseCallback):
-    def __init__(self, check_every=20000, success_thresh=0.7, min_eps=60):
+    # soft gate (0.6) + a per-stage step timeout: a slow-but-fine run can't get TRAPPED below the
+    # threshold and then diverge (the v2 post-mortem failure mode). Seeded run for reproducibility.
+    def __init__(self, check_every=20000, success_thresh=0.6, min_eps=60, stage_timeout=700_000):
         super().__init__()
         self.check_every = check_every
         self.thresh = success_thresh
         self.min_eps = min_eps
+        self.stage_timeout = stage_timeout
         self.stage = 0
         self._last = 0
+        self._stage_start = 0
 
     def _apply(self):
-        amax, assist, rand = STAGES[self.stage]
+        amax, assist, rand, tilt_deg = STAGES[self.stage]
         self.training_env.set_attr("init_angle_max", amax)
         self.training_env.set_attr("init_vel_assist", assist)
         self.training_env.set_attr("randomize", rand)
+        self.training_env.set_attr("tilt_amp", float(np.deg2rad(tilt_deg)))
         print(f"[curriculum] -> stage {self.stage}: init_angle_max={amax:.2f} "
-              f"assist={assist} randomize={rand}", flush=True)
+              f"assist={assist} randomize={rand} tilt={tilt_deg}deg", flush=True)
+
+    def _advance(self):
+        if self.stage < len(STAGES) - 1:
+            self.stage += 1
+            self._stage_start = self.num_timesteps
+            self._apply()
 
     def _on_training_start(self):
         self._apply()
@@ -70,11 +85,14 @@ class Curriculum(BaseCallback):
         buf = [e for e in self.model.ep_info_buffer if "is_success" in e]
         if len(buf) >= self.min_eps:
             rate = np.mean([e["is_success"] for e in buf[-self.min_eps:]])
+            stuck = self.num_timesteps - self._stage_start
             print(f"[curriculum] stage {self.stage} success={rate:.2f} "
-                  f"(t={self.num_timesteps})", flush=True)
-            if rate > self.thresh and self.stage < len(STAGES) - 1:
-                self.stage += 1
-                self._apply()
+                  f"(t={self.num_timesteps}, in_stage={stuck})", flush=True)
+            if rate > self.thresh:
+                self._advance()
+            elif stuck > self.stage_timeout:
+                print(f"[curriculum] stage {self.stage} TIMEOUT -> advancing anyway", flush=True)
+                self._advance()
         return True
 
 
@@ -84,6 +102,7 @@ def main():
     ap.add_argument("--nenv", type=int, default=8)
     ap.add_argument("--tag", default="run")          # per-run output subdir (parallel runs)
     ap.add_argument("--no_sde", action="store_true") # disable gSDE (ablation)
+    ap.add_argument("--seed", type=int, default=0)   # reproducibility (post-mortem fix)
     args = ap.parse_args()
     MODELS = os.path.join(HERE, "models", args.tag)
     os.makedirs(MODELS, exist_ok=True)
@@ -99,7 +118,7 @@ def main():
         gamma=0.998, tau=0.005, train_freq=1, gradient_steps=max(4, args.nenv // 2),  # gamma: ~2.5s horizon @200Hz
         learning_starts=10_000, ent_coef="auto",
         use_sde=not args.no_sde, sde_sample_freq=64,   # gSDE: smoother exploration -> sim-to-real
-        top_quantiles_to_drop_per_net=2,
+        top_quantiles_to_drop_per_net=2, seed=args.seed,
         device="cuda", verbose=1, tensorboard_log=os.path.join(HERE, "tb", args.tag),
     )
     callbacks = [
