@@ -34,7 +34,7 @@ PHI_SCALE = 25.0
 BETA_SCALE = 0.6     # board-tilt normalizer (~just above +-30 deg = 0.52 rad)
 BETADOT_SCALE = 3.0  # board-tilt-rate normalizer
 ARM_LIMIT = np.pi    # +-180 deg
-IMU_DECIM = 2        # BNO086 fusion ~100 Hz -> update beta every 2 ticks (200 Hz loop)
+IMU_DECIM = 1        # BNO086 over I2C @ 200 Hz -> refresh beta every tick (matches the loop)
 
 
 class FurutaEnv(gym.Env):
