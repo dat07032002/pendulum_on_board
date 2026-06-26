@@ -23,15 +23,17 @@ from furuta_env import FurutaEnv  # noqa: E402
 from sb3_contrib import TQC  # noqa: E402
 from stable_baselines3.common.monitor import Monitor  # noqa: E402
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor  # noqa: E402
-from stable_baselines3.common.callbacks import BaseCallback  # noqa: E402
+from stable_baselines3.common.callbacks import BaseCallback, EvalCallback  # noqa: E402
 
 
-def make_env(w):
+def make_env(w, randomize=False, init_angle=0.17, assist=0.0, free_arm=False):
     def _f():
-        e = FurutaEnv(randomize=False)        # stage 0: near-nominal
-        e.init_angle_max = 0.17               # +-10 deg
-        e.init_vel_assist = 0.0
+        e = FurutaEnv(randomize=randomize)    # stage 0: near-nominal; --randomize -> DR like stage 1+
+        e.init_angle_max = init_angle         # 0.17 = +-10 deg (stage 0); 0.79 = +-45 deg (stage 1)
+        e.init_vel_assist = assist
         e.arm_envelope_w = w
+        if free_arm:
+            e.arm_limit = None                # remove the +-180deg cable termination (free hinge)
         return Monitor(e, info_keywords=("is_success",))
     return _f
 
@@ -61,6 +63,12 @@ def main():
     ap.add_argument("--no_sde", action="store_true")
     ap.add_argument("--ent_coef", default="auto")
     ap.add_argument("--target_entropy", default="auto")
+    ap.add_argument("--randomize", action="store_true")          # DR on (mimic stage 1+)
+    ap.add_argument("--init_angle", type=float, default=0.17)    # 0.17=stage0, 0.79=stage1
+    ap.add_argument("--assist", type=float, default=0.0)
+    ap.add_argument("--eval", action="store_true")               # add trainer-style EvalCallback
+    ap.add_argument("--eval_tilt_deg", type=float, default=30.0)
+    ap.add_argument("--free_arm", action="store_true")           # remove +-180deg cable termination
     args = ap.parse_args()
     ec = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     te = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
@@ -68,7 +76,9 @@ def main():
           f"sde={not args.no_sde}, ent_coef={args.ent_coef}, target_entropy={args.target_entropy} ===",
           flush=True)
 
-    venv = VecMonitor(SubprocVecEnv([make_env(args.w) for _ in range(args.nenv)]),
+    venv = VecMonitor(SubprocVecEnv([make_env(args.w, args.randomize, args.init_angle, args.assist,
+                                              args.free_arm)
+                                     for _ in range(args.nenv)]),
                       info_keywords=("is_success",))
     model = TQC(
         "MlpPolicy", venv,
@@ -79,7 +89,17 @@ def main():
         use_sde=not args.no_sde, sde_sample_freq=64, top_quantiles_to_drop_per_net=2,
         device="cuda", verbose=0, seed=args.seed,
     )
-    model.learn(total_timesteps=args.steps, callback=RollingReport(), progress_bar=False)
+    callbacks = [RollingReport()]
+    if args.eval:   # mirror train_tqc.py's EvalCallback (eval at +-eval_tilt_deg full swing-up + DR)
+        import numpy as _np
+        eval_env = VecMonitor(SubprocVecEnv([make_env(args.w, True, _np.pi, 0.0, args.free_arm)]),
+                              info_keywords=("is_success",))
+        eval_env.set_attr("tilt_amp", float(_np.deg2rad(args.eval_tilt_deg)))
+        callbacks.append(EvalCallback(eval_env, eval_freq=20_000 // args.nenv,
+                                      n_eval_episodes=20, deterministic=True, verbose=0))
+        print(f"  [eval callback ON: +-{args.eval_tilt_deg}deg tilt, every {20_000//args.nenv} steps]",
+              flush=True)
+    model.learn(total_timesteps=args.steps, callback=callbacks, progress_bar=False)
     print(f"=== done w={args.w} ===", flush=True)
 
 

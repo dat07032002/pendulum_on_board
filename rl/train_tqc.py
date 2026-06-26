@@ -48,27 +48,35 @@ STAGES = [
 ]
 
 
-def make_env(randomize=True):
+def make_env(randomize=True, free_arm=False):
     def _f():
-        return Monitor(FurutaEnv(randomize=randomize), info_keywords=("is_success",))
+        e = FurutaEnv(randomize=randomize)
+        if free_arm:
+            e.arm_limit = None          # remove the +-180deg cable termination (sim-only ceiling probe)
+        return Monitor(e, info_keywords=("is_success",))
     return _f
 
 
 class Curriculum(BaseCallback):
     # soft gate (0.6) + a per-stage step timeout: a slow-but-fine run can't get TRAPPED below the
     # threshold and then diverge (the v2 post-mortem failure mode). Seeded run for reproducibility.
-    def __init__(self, check_every=20000, success_thresh=0.6, min_eps=60, stage_timeout=700_000):
+    def __init__(self, check_every=20000, success_thresh=0.6, min_eps=60, stage_timeout=700_000,
+                 start_stage=0, max_stage=None, force_no_dr=False):
         super().__init__()
         self.check_every = check_every
         self.thresh = success_thresh
         self.min_eps = min_eps
         self.stage_timeout = stage_timeout
-        self.stage = 0
+        self.stage = start_stage
+        self.max_stage = (len(STAGES) - 1) if max_stage is None else max_stage
+        self.force_no_dr = force_no_dr   # Phase A: DR + tilt OFF for ALL stages (nominal pretrain)
         self._last = 0
         self._stage_start = 0
 
     def _apply(self):
         amax, assist, rand, tilt_deg = STAGES[self.stage]
+        if self.force_no_dr:             # nominal pretrain: never enable DR/tilt
+            rand, tilt_deg = False, 0
         self.training_env.set_attr("init_angle_max", amax)
         self.training_env.set_attr("init_vel_assist", assist)
         self.training_env.set_attr("randomize", rand)
@@ -77,7 +85,7 @@ class Curriculum(BaseCallback):
               f"assist={assist} randomize={rand} tilt={tilt_deg}deg", flush=True)
 
     def _advance(self):
-        if self.stage < len(STAGES) - 1:
+        if self.stage < self.max_stage:
             self.stage += 1
             self._stage_start = self.num_timesteps
             self._apply()
@@ -114,37 +122,52 @@ def main():
     ap.add_argument("--no_sde", dest="use_sde", action="store_false", default=False)  # default
     ap.add_argument("--sde", dest="use_sde", action="store_true")  # enable gSDE (contrast run)
     ap.add_argument("--seed", type=int, default=0)   # reproducibility (post-mortem fix)
-    ap.add_argument("--ent_coef", default="auto")    # "auto" or a float (entropy fix)
+    ap.add_argument("--ent_coef", default="auto")    # "auto" or a float (Phase B: fixed e.g. 0.05)
     ap.add_argument("--target_entropy", default="auto")  # "auto"(=-act_dim) or a float (e.g. -2)
     ap.add_argument("--eval_tilt_deg", type=float, default=30.0)  # eval at deployment tilt
+    ap.add_argument("--lr", type=float, default=3e-4)        # Phase B fine-tune: lower (1e-4)
+    # --- two-phase warm-start ---
+    ap.add_argument("--no_dr", action="store_true")         # Phase A: DR+tilt OFF, stages 0-4 only
+    ap.add_argument("--warmstart", default=None)            # Phase B: load policy weights from this .zip
+    ap.add_argument("--start_stage", type=int, default=0)   # Phase B: resume curriculum at this stage
+    ap.add_argument("--max_stage", type=int, default=None)  # last stage to reach (no_dr -> 4)
+    ap.add_argument("--free_arm", action="store_true")      # remove +-180 cable limit (ceiling probe)
     args = ap.parse_args()
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
+    max_stage = args.max_stage if args.max_stage is not None else (4 if args.no_dr else len(STAGES) - 1)
     MODELS = os.path.join(HERE, "models", args.tag)
     os.makedirs(MODELS, exist_ok=True)
 
-    venv = VecMonitor(SubprocVecEnv([make_env(True) for _ in range(args.nenv)]),
+    venv = VecMonitor(SubprocVecEnv([make_env(True, args.free_arm) for _ in range(args.nenv)]),
                       info_keywords=("is_success",))
-    eval_env = VecMonitor(SubprocVecEnv([make_env(True)]), info_keywords=("is_success",))
-    # EVAL AT THE DEPLOYMENT CONDITION: full swing-up + +-eval_tilt_deg random tilt + DR, so
-    # best_model.zip is selected on real tilt performance (the eval env is NOT curriculum-synced).
+    # EVAL CONDITION: Phase B -> deployment (full swing-up + +-eval_tilt_deg random tilt + DR);
+    # Phase A (--no_dr) -> nominal full swing-up, level, no DR. best_model.zip selected on this.
+    eval_env = VecMonitor(SubprocVecEnv([make_env(not args.no_dr, args.free_arm)]),
+                          info_keywords=("is_success",))
     eval_env.set_attr("init_angle_max", np.pi)
-    eval_env.set_attr("tilt_amp", float(np.deg2rad(args.eval_tilt_deg)))
+    eval_env.set_attr("tilt_amp", float(np.deg2rad(0.0 if args.no_dr else args.eval_tilt_deg)))
 
     model = TQC(
         "MlpPolicy", venv,
         policy_kwargs=dict(net_arch=dict(pi=[64, 64], qf=[256, 256])),
-        learning_rate=3e-4, buffer_size=400_000, batch_size=512,
+        learning_rate=args.lr, buffer_size=400_000, batch_size=512,
         gamma=0.998, tau=0.005, train_freq=1, gradient_steps=max(4, args.nenv // 2),  # gamma: ~2.5s horizon @200Hz
         learning_starts=10_000, ent_coef=ent_coef, target_entropy=target_entropy,
         use_sde=args.use_sde, sde_sample_freq=64,   # default OFF (entropy-collapse fix; see args)
         top_quantiles_to_drop_per_net=2, seed=args.seed,
         device="cuda", verbose=1, tensorboard_log=os.path.join(HERE, "tb", args.tag),
     )
+    if args.warmstart:   # Phase B: copy actor+critic weights from the Phase-A nominal master
+        src = TQC.load(args.warmstart, device="cuda")
+        model.policy.load_state_dict(src.policy.state_dict())
+        del src
+        print(f"[warmstart] loaded policy weights from {args.warmstart} "
+              f"(lr={args.lr}, ent_coef={ent_coef}, start_stage={args.start_stage})", flush=True)
     callbacks = [
-        Curriculum(),
+        Curriculum(start_stage=args.start_stage, max_stage=max_stage, force_no_dr=args.no_dr),
         EvalCallback(eval_env, best_model_save_path=MODELS, log_path=MODELS,
-                     eval_freq=20_000 // args.nenv, n_eval_episodes=20, deterministic=True),
+                     eval_freq=20_000 // args.nenv, n_eval_episodes=50, deterministic=True),
         # periodic checkpoints so we can recover the PEAK policy if a run later regresses
         CheckpointCallback(save_freq=max(100_000 // args.nenv, 1), save_path=MODELS,
                            name_prefix="ckpt"),

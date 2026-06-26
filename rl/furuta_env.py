@@ -75,6 +75,7 @@ class FurutaEnv(gym.Env):
         self.init_vel_assist = 0.0
         self.p_corner = 0.3              # fraction of DR draws pushed to a min/max extreme
         self.arm_envelope_w = 0.0        # >90deg arm penalty (0 = deployed-v1 behavior; off here)
+        self.arm_limit = ARM_LIMIT       # hard cable limit [rad]; set None to free the arm (diag)
         # tilt curriculum (set externally): max board-tilt amplitude this stage (0 = level ground)
         self.tilt_amp = 0.0
         self.tilt_betadot_max = 2.0      # cap on random tilt rate [rad/s] (Phase-0 feasible bound)
@@ -234,7 +235,7 @@ class FurutaEnv(gym.Env):
 
         self.steps += 1
         terminated = False
-        if abs(phi) > ARM_LIMIT:                             # cable limit
+        if self.arm_limit is not None and abs(phi) > self.arm_limit:  # cable limit (None = free arm)
             r -= 10.0
             terminated = True
         # fall-termination: once it's been up, ending the episode when it falls past 90 deg
