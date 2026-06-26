@@ -16,15 +16,36 @@ IMU** on the board. One ESP32 runs everything. Deploy on-chip like project #1.
 
 **Where we are:**
 - ✅ **Phase 0** (sim feasibility) done — ±30° is physically feasible; orientation-dependent.
-- ✅ **Phase 1 CODE** done — 8-D tilt env, true-vertical reward, tilt curriculum, post-mortem train
-  fixes, obs-agnostic exporter. All validated locally.
-- ⏳ **Phase 1 TRAIN** RUNNING — **3 seeds on the UT server** (`~/furuta_tilt/`, GPU 0/1/2, 8 M steps
-  each, started 2026-06-26). Not yet validated.
+- ✅ **Phase 1 CODE** done — 8-D tilt env, true-vertical reward, tilt curriculum, obs-agnostic
+  exporter. All validated locally.
+- ⏸️ **Phase 1 TRAIN — STOPPED (2026-06-26), needs a config fix before relaunch.** First runs (nenv=16)
+  were slow; relaunched at nenv=8 (correct), but then **all seeds oscillated in stage 0 and never
+  crossed the 0.6 gate** — diagnosed as an **entropy collapse**: `ent_coef` stuck ~0.77 (vs project #1's
+  ~0.24) → policy too stochastic → noisy balance. Critic was healthy (not divergence). **Fixes are
+  staged but NOT yet validated/launched.** Server is idle.
 - ⬜ **Phases 2–5** (hardware: LX-16A + BNO086 wiring/firmware, deploy, iterate) — not started.
 
-**Immediate next action for the next agent:** monitor/finish the 3 training seeds, pick the best
-`best_model.zip`, judge it against `rl/POLICY_RUBRIC.md` (incl. the **Tilt-project additions**),
-then start Phase 2 hardware.
+**▶ IMMEDIATE NEXT ACTION (START HERE tomorrow):**
+1. **Finish the entropy validation sweep** (was interrupted). Run the stage-0 diag to ~300k on the
+   two candidates and pick the one that crosses 0.6 and HOLDS (vs the baseline that collapses):
+   - `cd ~/.../tilt_pendulum/rl`
+   - `python diag_stage0.py --no_sde --steps 300000 --nenv 8 --seed 0 > A.log 2>&1`  (gSDE off)
+   - `python diag_stage0.py --target_entropy -2 --steps 300000 --nenv 8 --seed 0 > B.log 2>&1`
+   - (NOTE: don't pipe through `tail`/`grep` to a file — it block-buffers; redirect raw so you can
+     read progress. Each ~17 min on a 5070.)
+2. **Lock the winning config** as the `train_tqc.py` default (it already has `--no_sde / --ent_coef /
+   --target_entropy` knobs and the eval-at-±30°-tilt fix).
+3. **Launch on the UT server** (`~/furuta_tilt/`, reuse `~/furuta_rl/.venv`): **3 seeds with the
+   winner + 1 seed with the gSDE-variant contrast** (user asked for an sde A/B), `--nenv 8
+   --steps 8000000 --eval_tilt_deg 30 --seed {0,1,2}`, GPUs 0–3. Example:
+   `CUDA_VISIBLE_DEVICES=0 nohup ~/furuta_rl/.venv/bin/python rl/train_tqc.py --no_sde --nenv 8
+   --steps 8000000 --seed 0 --tag tilt_s0 > train_tilt_s0.log 2>&1 &`  (drop `--no_sde` on the
+   contrast seed). nohup = survives logout.
+4. Then monitor → **keep best `best_model.zip` across seeds** (now eval'd under ±30° tilt) → judge
+   vs `rl/POLICY_RUBRIC.md` (Tilt additions) → Phase 2 hardware.
+
+Project #1 peaked at only **~0.7 M steps** (5 stages); expect this to peak ~1–3 M (8 stages). 8 M is
+a ceiling, not a target — `best_model` captures the peak; stop early once seeds plateau.
 
 ---
 
@@ -131,7 +152,7 @@ across stages. DR off in stage 0 only.
 
 ---
 
-## 4. Training run (in progress) — UT server
+## 4. Training run — UT server  (STOPPED 2026-06-26; resume per §0 — fix entropy, then relaunch)
 
 - `ssh -i ~/.ssh/aere_codex_ed25519 tn22833@aere-a83514.ae.utexas.edu` (needs **UT VPN**).
 - Project dir **`~/furuta_tilt/`** (code in `rl/`). **Reuses `~/furuta_rl/.venv`** (torch cu124 +
@@ -197,6 +218,13 @@ easier, but the policy must still handle transits through φ=90°.
   PPO intuition "more envs = better" does NOT apply because `gradient_steps` scales with nenv. A
   cleaner future fix is to **decouple** them — fix `gradient_steps` independent of nenv.) Evidence:
   tilt env stage-0 reached 0.41@80k at nenv=8 (== project #1's 0.43) but only 0.28@400k at nenv=16.
+- **ENTROPY COLLAPSE (2026-06-26, open — fix staged not validated).** At nenv=8 the seeds learned
+  stage-0 to ~0.4–0.55 by ~160–200k then **oscillated/dropped** (s1 0.55→0.18) and never crossed the
+  0.6 gate. Root cause = **`ent_coef` stuck ~0.77** (vs project #1's ~0.24) → policy too stochastic →
+  noisy balance. NOT critic divergence (`critic_loss` stable ~4.7). Staged fixes (configurable in
+  `train_tqc.py`/`diag_stage0.py`): **`--no_sde`** (disable gSDE — prime suspect) and/or
+  **`--target_entropy -2`** (force the policy to commit) and/or a small fixed `--ent_coef`. **Must run
+  the diag sweep first** (see §0 step 1) to pick the one that holds, before the full launch.
 - **Adaptive quantile dropping** was considered and **deferred** — not our bottleneck; keep fixed
   `top_quantiles_to_drop_per_net=2`. If overestimation instability appears, sweep the fixed value
   (3/5) before anything custom.
