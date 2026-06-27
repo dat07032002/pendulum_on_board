@@ -97,7 +97,8 @@ class FurutaEnv(gym.Env):
             if rng.random() < self.p_corner:            # -> trains worst-case corners, not just center
                 return lo if rng.random() < 0.5 else hi
             return rng.uniform(lo, hi)
-        self.model.actuator_gear[0, 0] = u(0.008, 0.020)                 # KM (~2x spread)
+        self.model.actuator_gear[0, 0] = u(0.010, 0.016)                 # KM, ~+-25% of 0.0127 nominal
+                                                                         # (tightened from 0.008-0.020)
         self.model.dof_damping[self.dadr_a] = u(3e-4, 10e-4)
         self.model.dof_damping[self.dadr_p] = u(2e-5, 1.0e-4)
         self.model.dof_frictionloss[self.dadr_a] = u(4e-3, 8e-3)
