@@ -163,6 +163,8 @@ def main():
     ap.add_argument("--arm_center_w", type=float, default=0.20)  # arm-centering weight; LOW (~0.02)
     ap.add_argument("--stop_success", type=float, default=None)  # early-stop at this eval success rate
     ap.add_argument("--n_eval", type=int, default=50)            # eval episodes (more = less noisy stop)
+    ap.add_argument("--tqd", type=int, default=2)               # top_quantiles_to_drop (3=more conservative
+                                                                # critic, fights overestimation collapse)
     args = ap.parse_args()                                       # frees the arm to pump for swing-up
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
@@ -191,7 +193,7 @@ def main():
         gamma=0.998, tau=0.005, train_freq=1, gradient_steps=max(4, args.nenv // 2),  # gamma: ~2.5s horizon @200Hz
         learning_starts=10_000, ent_coef=ent_coef, target_entropy=target_entropy,
         use_sde=args.use_sde, sde_sample_freq=64,   # default OFF (entropy-collapse fix; see args)
-        top_quantiles_to_drop_per_net=2, seed=args.seed,
+        top_quantiles_to_drop_per_net=args.tqd, seed=args.seed,
         device="cuda", verbose=1, tensorboard_log=os.path.join(HERE, "tb", args.tag),
     )
     if args.warmstart:   # Phase B: copy actor+critic weights from the Phase-A nominal master
