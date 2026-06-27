@@ -1,6 +1,12 @@
 # HANDOFF — Furuta pendulum on a randomly-TILTING base (±30°)
 
 Last updated 2026-06-26. This is the full state + context so another agent can continue.
+
+> ⭐ **NEWEST WORK: read `SESSION_2026-06-26.md` FIRST.** It supersedes the state below — nominal
+> swing-up+balance is now SOLVED (0.97 verified master `rl/models/nomB_fa_s0/best_model.zip`), but
+> tilt-robustification is not, and we found the SB3 DR eval is unreliable (over-reports badly). Verify
+> any policy with `rl/eval_policy.py`. Start from that file's §0.
+
 The step-plan lives at `~/.claude/plans/async-beaming-teapot.md` (the "ACTIVE PLAN" section at top).
 
 This is **project #2**, built on top of a completed project #1. Read both sections below.
