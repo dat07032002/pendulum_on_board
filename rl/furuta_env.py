@@ -73,7 +73,8 @@ class FurutaEnv(gym.Env):
         # curriculum (set externally): initial |theta_up| range + optional velocity assist
         self.init_angle_max = np.pi      # default: full swing-up from hanging
         self.init_vel_assist = 0.0
-        self.p_corner = 0.3              # fraction of DR draws pushed to a min/max extreme
+        self.p_corner = 0.1              # fraction of DR draws pushed to a min/max extreme (was 0.3:
+                                         # too aggressive -> stacked impossible multi-corner plants)
         self.arm_envelope_w = 0.0        # >90deg arm penalty (0 = deployed-v1 behavior; off here)
         self.arm_center_w = 0.20         # arm-centering (phi/pi)^2 weight; LOWER it to allow the
                                          # arm to pump for swing-up (0.20 strangled it; ~0.02 frees it)
