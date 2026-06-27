@@ -111,6 +111,31 @@ class Curriculum(BaseCallback):
         return True
 
 
+class StopOnSuccess(BaseCallback):
+    """Stop training once the EvalCallback's eval success_rate reaches a threshold -> capture the
+    peak and skip the post-peak collapse. Used as EvalCallback(callback_after_eval=...), so
+    self.parent is the EvalCallback and self.parent._is_success_buffer holds the last eval's flags.
+    Only fires at the FINAL curriculum stage (don't stop early on an easy intermediate stage)."""
+    def __init__(self, threshold, max_stage):
+        super().__init__()
+        self.threshold = threshold
+        self.max_stage = max_stage
+        self.curriculum = None        # set in main() so we can check the current stage
+
+    def _on_step(self):
+        if self.curriculum is not None and self.curriculum.stage < self.max_stage:
+            return True               # not at the target stage yet -> keep training
+        buf = getattr(self.parent, "_is_success_buffer", [])
+        if len(buf) > 0:
+            sr = float(np.mean(buf))
+            if sr >= self.threshold:
+                print(f"[stop_success] eval success_rate {sr:.2f} >= {self.threshold} at "
+                      f"{self.num_timesteps} steps (stage {getattr(self.curriculum,'stage','?')}) "
+                      f"-> stopping", flush=True)
+                return False          # stops training
+        return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=2_000_000)
@@ -133,6 +158,8 @@ def main():
     ap.add_argument("--max_stage", type=int, default=None)  # last stage to reach (no_dr -> 4)
     ap.add_argument("--free_arm", action="store_true")      # remove +-180 cable limit (ceiling probe)
     ap.add_argument("--arm_center_w", type=float, default=0.20)  # arm-centering weight; LOW (~0.02)
+    ap.add_argument("--stop_success", type=float, default=None)  # early-stop at this eval success rate
+    ap.add_argument("--n_eval", type=int, default=50)            # eval episodes (more = less noisy stop)
     args = ap.parse_args()                                       # frees the arm to pump for swing-up
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
@@ -167,10 +194,18 @@ def main():
         del src
         print(f"[warmstart] loaded policy weights from {args.warmstart} "
               f"(lr={args.lr}, ent_coef={ent_coef}, start_stage={args.start_stage})", flush=True)
+    curriculum = Curriculum(start_stage=args.start_stage, max_stage=max_stage, force_no_dr=args.no_dr)
+    stop_cb = None
+    if args.stop_success is not None:
+        stop_cb = StopOnSuccess(args.stop_success, max_stage)
+        stop_cb.curriculum = curriculum     # so it only fires at the final stage
+        print(f"[stop_success] will stop when eval success_rate >= {args.stop_success} "
+              f"at stage {max_stage} (n_eval={args.n_eval})", flush=True)
     callbacks = [
-        Curriculum(start_stage=args.start_stage, max_stage=max_stage, force_no_dr=args.no_dr),
+        curriculum,
         EvalCallback(eval_env, best_model_save_path=MODELS, log_path=MODELS,
-                     eval_freq=20_000 // args.nenv, n_eval_episodes=50, deterministic=True),
+                     eval_freq=20_000 // args.nenv, n_eval_episodes=args.n_eval,
+                     deterministic=True, callback_after_eval=stop_cb),
         # periodic checkpoints so we can recover the PEAK policy if a run later regresses
         CheckpointCallback(save_freq=max(100_000 // args.nenv, 1), save_path=MODELS,
                            name_prefix="ckpt"),

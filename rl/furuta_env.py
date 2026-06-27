@@ -220,13 +220,15 @@ class FurutaEnv(gym.Env):
         r -= self.arm_envelope_w * max(0.0, abs(phi) - np.pi / 2) ** 2
         if up > 0.5:                                         # upper half: settle the pole
             r -= 0.01 * thd**2
-        # bonus only when balanced AND the arm is bounded -> can't earn it by drifting
-        if up > 0.92 and abs(thd) < 3.0 and abs(phi) < np.pi / 2:
+        # arm bound only matters when there's a cable; free arm (arm_limit None) -> no arm constraint
+        arm_ok = self.arm_limit is None or abs(phi) < np.pi / 2
+        # bonus only when balanced AND (cable: arm bounded) -> can't earn it by drifting
+        if up > 0.92 and abs(thd) < 3.0 and arm_ok:
             r += 2.0
         self.prev_action = a
 
-        # success = pendulum upright (cos>0.9 ~25 deg, |thd|<4) AND arm bounded (<90 deg)
-        if up > 0.9 and abs(thd) < 4.0 and abs(phi) < np.pi / 2:
+        # success = pendulum upright (cos>0.9 ~25 deg, |thd|<4) AND (cable: arm bounded <90 deg)
+        if up > 0.9 and abs(thd) < 4.0 and arm_ok:
             self._up_streak += 1
             self._best_up_streak = max(self._best_up_streak, self._up_streak)
         else:
