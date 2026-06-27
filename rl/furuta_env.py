@@ -154,7 +154,9 @@ class FurutaEnv(gym.Env):
 
         # tilt: per-episode random board motion (None = level ground). Amplitude + rate randomized
         # up to the curriculum's tilt_amp / betadot cap. Driven each step via the position actuator.
-        if self.tilt_amp > 1e-4 and self.randomize:
+        # DECOUPLED from `randomize` (2026-06-27): tilt is the TASK, `randomize` is plant-DR. This
+        # lets us train tilt WITHOUT plant-DR first, then add DR for robustness (`randomize=True`).
+        if self.tilt_amp > 1e-4:
             amp = rng.uniform(0.3, 1.0) * self.tilt_amp
             rate = rng.uniform(0.5, self.tilt_betadot_max)
             self.tilt_gen = TiltGenerator(beta_max=amp, betadot_max=rate, dt=DT,

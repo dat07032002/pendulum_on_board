@@ -61,7 +61,7 @@ class Curriculum(BaseCallback):
     # soft gate (0.6) + a per-stage step timeout: a slow-but-fine run can't get TRAPPED below the
     # threshold and then diverge (the v2 post-mortem failure mode). Seeded run for reproducibility.
     def __init__(self, check_every=20000, success_thresh=0.6, min_eps=60, stage_timeout=700_000,
-                 start_stage=0, max_stage=None, force_no_dr=False):
+                 start_stage=0, max_stage=None, force_no_dr=False, no_plant_dr=False):
         super().__init__()
         self.check_every = check_every
         self.thresh = success_thresh
@@ -70,6 +70,7 @@ class Curriculum(BaseCallback):
         self.stage = start_stage
         self.max_stage = (len(STAGES) - 1) if max_stage is None else max_stage
         self.force_no_dr = force_no_dr   # Phase A: DR + tilt OFF for ALL stages (nominal pretrain)
+        self.no_plant_dr = no_plant_dr   # tilt phase: keep TILT but force plant-DR off (no randomize)
         self._last = 0
         self._stage_start = 0
 
@@ -77,6 +78,8 @@ class Curriculum(BaseCallback):
         amax, assist, rand, tilt_deg = STAGES[self.stage]
         if self.force_no_dr:             # nominal pretrain: never enable DR/tilt
             rand, tilt_deg = False, 0
+        elif self.no_plant_dr:           # tilt without plant-DR: keep tilt_deg, drop randomize
+            rand = False
         # env_method (NOT set_attr — set_attr writes to the Monitor wrapper, never reaches FurutaEnv)
         self.training_env.env_method("set_params", init_angle_max=amax, init_vel_assist=assist,
                                      randomize=rand, tilt_amp=float(np.deg2rad(tilt_deg)))
@@ -152,6 +155,7 @@ def main():
     ap.add_argument("--lr", type=float, default=3e-4)        # Phase B fine-tune: lower (1e-4)
     # --- two-phase warm-start ---
     ap.add_argument("--no_dr", action="store_true")         # Phase A: DR+tilt OFF, stages 0-4 only
+    ap.add_argument("--no_plant_dr", action="store_true")   # tilt phase: TILT on, plant-DR off
     ap.add_argument("--warmstart", default=None)            # Phase B: load policy weights from this .zip
     ap.add_argument("--start_stage", type=int, default=0)   # Phase B: resume curriculum at this stage
     ap.add_argument("--max_stage", type=int, default=None)  # last stage to reach (no_dr -> 4)
@@ -170,7 +174,9 @@ def main():
                       info_keywords=("is_success",))
     # EVAL CONDITION: Phase B -> deployment (full swing-up + +-eval_tilt_deg random tilt + DR);
     # Phase A (--no_dr) -> nominal full swing-up, level, no DR. best_model.zip selected on this.
-    eval_env = VecMonitor(SubprocVecEnv([make_env(not args.no_dr, args.free_arm)]),
+    # eval plant-DR: off for nominal (--no_dr) and tilt-no-DR (--no_plant_dr); on otherwise.
+    eval_dr = not (args.no_dr or args.no_plant_dr)
+    eval_env = VecMonitor(SubprocVecEnv([make_env(eval_dr, args.free_arm)]),
                           info_keywords=("is_success",))
     # env_method (NOT set_attr — see Curriculum._apply / FurutaEnv.set_params)
     eval_env.env_method("set_params", init_angle_max=float(np.pi),
@@ -194,7 +200,8 @@ def main():
         del src
         print(f"[warmstart] loaded policy weights from {args.warmstart} "
               f"(lr={args.lr}, ent_coef={ent_coef}, start_stage={args.start_stage})", flush=True)
-    curriculum = Curriculum(start_stage=args.start_stage, max_stage=max_stage, force_no_dr=args.no_dr)
+    curriculum = Curriculum(start_stage=args.start_stage, max_stage=max_stage,
+                            force_no_dr=args.no_dr, no_plant_dr=args.no_plant_dr)
     stop_cb = None
     if args.stop_success is not None:
         stop_cb = StopOnSuccess(args.stop_success, max_stage)
