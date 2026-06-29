@@ -14,7 +14,8 @@ Curriculum (advances when rolling success rate > 0.7): start balancing near upri
 widen the initial tilt, then add energy-pumping from near hanging, then full swing-up from
 rest. Domain randomization is on from stage 1 onward (stage 0 near-nominal so balance is
 learned cleanly first). Actor net is [64,64] (small enough to port to the ESP32); the TQC
-critics can be larger since they're training-only. Best model (by eval success) -> rl/models/.
+critics can be larger since they're training-only. `best_success_model.zip` is selected by
+sustained eval success; SB3's `best_model.zip` remains the best by mean reward.
 """
 from __future__ import annotations
 
@@ -28,23 +29,27 @@ sys.path.insert(0, os.path.dirname(__file__))
 from furuta_env import FurutaEnv  # noqa: E402
 
 from sb3_contrib import TQC  # noqa: E402
+from retention_tqc import RetentionTQC  # noqa: E402
 from stable_baselines3.common.monitor import Monitor  # noqa: E402
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor  # noqa: E402
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback, CheckpointCallback  # noqa: E402
 
 HERE = os.path.dirname(__file__)
 
-# (init_angle_max [rad], init_vel_assist, randomize, tilt_amp_deg)
-# Stages 0-4 learn the full task on LEVEL ground (as deployed v1), then 5-7 ramp the board tilt in.
+# (init_angle_max [rad], init_vel_assist, randomize, tilt_deg, dr_probability, dr_scale)
+# Phase C starts at stage 4 with the target +-20deg tilt already active, then ramps only plant DR.
+# Non-DR episodes remain clean +-20deg rehearsal, so robustification cannot erase the tilt skill.
 STAGES = [
-    (0.17,  0.0, False, 0),    # 0: balance ~10 deg, level, near-nominal
-    (0.79,  0.0, True,  0),    # 1: catch ~45 deg + DR, level
-    (1.57,  0.0, True,  0),    # 2: ~90 deg, level
-    (2.60,  1.5, True,  0),    # 3: near hanging + energy-pump assist, level
-    (np.pi, 0.0, True,  0),    # 4: full swing-up from rest, level
-    (np.pi, 0.0, True,  10),   # 5: full task + gentle +-10 deg random tilt
-    (np.pi, 0.0, True,  20),   # 6: + moderate +-20 deg tilt
-    (np.pi, 0.0, True,  30),   # 7: + full +-30 deg random tilt (target)
+    (0.17,  0.0, False, 0,  0.00, 0.00),
+    (0.79,  0.0, True,  0,  1.00, 1.00),
+    (1.57,  0.0, True,  0,  1.00, 1.00),
+    (2.60,  1.5, True,  0,  1.00, 1.00),
+    (np.pi, 0.0, False, 20, 0.00, 0.00),  # 4: clean target tilt
+    (np.pi, 0.0, True,  20, 0.10, 0.25),  # 5: light DR, 90% clean rehearsal
+    (np.pi, 0.0, True,  20, 0.25, 0.50),  # 6: moderate DR
+    (np.pi, 0.0, True,  20, 0.50, 0.75),  # 7: strong DR
+    (np.pi, 0.0, True,  20, 0.75, 1.00),  # 8: mostly full-range DR
+    (np.pi, 0.0, True,  20, 0.90, 1.00),  # 9: target mix, 10% clean rehearsal
 ]
 
 
@@ -53,43 +58,51 @@ def make_env(randomize=True, free_arm=False):
         e = FurutaEnv(randomize=randomize)
         if free_arm:
             e.arm_limit = None          # remove the +-180deg cable termination (sim-only ceiling probe)
-        return Monitor(e, info_keywords=("is_success",))
+        return Monitor(e, info_keywords=("is_success", "is_catch_success"))
     return _f
 
 
 class Curriculum(BaseCallback):
     # soft gate (0.6) + a per-stage step timeout: a slow-but-fine run can't get TRAPPED below the
     # threshold and then diverge (the v2 post-mortem failure mode). Seeded run for reproducibility.
-    def __init__(self, check_every=20000, success_thresh=0.6, min_eps=60, stage_timeout=700_000,
-                 start_stage=0, max_stage=None, force_no_dr=False, no_plant_dr=False):
+    def __init__(self, check_every=20000, success_thresh=0.8, min_eps=60, stage_timeout=700_000,
+                 min_stage_steps=100_000, passes_required=2, start_stage=0, max_stage=None,
+                 force_no_dr=False, no_plant_dr=False):
         super().__init__()
         self.check_every = check_every
         self.thresh = success_thresh
         self.min_eps = min_eps
         self.stage_timeout = stage_timeout
+        self.min_stage_steps = min_stage_steps
+        self.passes_required = passes_required
         self.stage = start_stage
         self.max_stage = (len(STAGES) - 1) if max_stage is None else max_stage
         self.force_no_dr = force_no_dr   # Phase A: DR + tilt OFF for ALL stages (nominal pretrain)
         self.no_plant_dr = no_plant_dr   # tilt phase: keep TILT but force plant-DR off (no randomize)
         self._last = 0
         self._stage_start = 0
+        self._consecutive_passes = 0
 
     def _apply(self):
-        amax, assist, rand, tilt_deg = STAGES[self.stage]
+        amax, assist, rand, tilt_deg, dr_probability, dr_scale = STAGES[self.stage]
         if self.force_no_dr:             # nominal pretrain: never enable DR/tilt
-            rand, tilt_deg = False, 0
+            rand, tilt_deg, dr_probability, dr_scale = False, 0, 0.0, 0.0
         elif self.no_plant_dr:           # tilt without plant-DR: keep tilt_deg, drop randomize
-            rand = False
+            rand, dr_probability, dr_scale = False, 0.0, 0.0
         # env_method (NOT set_attr — set_attr writes to the Monitor wrapper, never reaches FurutaEnv)
         self.training_env.env_method("set_params", init_angle_max=amax, init_vel_assist=assist,
-                                     randomize=rand, tilt_amp=float(np.deg2rad(tilt_deg)))
+                                     randomize=rand, tilt_amp=float(np.deg2rad(tilt_deg)),
+                                     dr_probability=dr_probability, dr_scale=dr_scale)
         print(f"[curriculum] -> stage {self.stage}: init_angle_max={amax:.2f} "
-              f"assist={assist} randomize={rand} tilt={tilt_deg}deg", flush=True)
+              f"assist={assist} randomize={rand} tilt={tilt_deg}deg "
+              f"dr_prob={dr_probability:.2f} dr_scale={dr_scale:.2f}", flush=True)
 
     def _advance(self):
         if self.stage < self.max_stage:
             self.stage += 1
             self._stage_start = self.num_timesteps
+            self._consecutive_passes = 0
+            self.model.ep_info_buffer.clear()
             self._apply()
 
     def _on_training_start(self):
@@ -104,37 +117,69 @@ class Curriculum(BaseCallback):
             rate = np.mean([e["is_success"] for e in buf[-self.min_eps:]])
             stuck = self.num_timesteps - self._stage_start
             print(f"[curriculum] stage {self.stage} success={rate:.2f} "
-                  f"(t={self.num_timesteps}, in_stage={stuck})", flush=True)
-            if rate > self.thresh:
+                  f"(t={self.num_timesteps}, in_stage={stuck}, "
+                  f"passes={self._consecutive_passes}/{self.passes_required})", flush=True)
+            if stuck < self.min_stage_steps:
+                return True
+            if rate >= self.thresh:
+                self._consecutive_passes += 1
+            else:
+                self._consecutive_passes = 0
+            if self._consecutive_passes >= self.passes_required:
                 self._advance()
             elif stuck > self.stage_timeout:
-                print(f"[curriculum] stage {self.stage} TIMEOUT -> advancing anyway", flush=True)
-                self._advance()
+                print(f"[curriculum] stage {self.stage} TIMEOUT -> stopping seed", flush=True)
+                return False
         return True
 
 
-class StopOnSuccess(BaseCallback):
-    """Stop training once the EvalCallback's eval success_rate reaches a threshold -> capture the
-    peak and skip the post-peak collapse. Used as EvalCallback(callback_after_eval=...), so
-    self.parent is the EvalCallback and self.parent._is_success_buffer holds the last eval's flags.
-    Only fires at the FINAL curriculum stage (don't stop early on an easy intermediate stage)."""
-    def __init__(self, threshold, max_stage):
+class SaveBestSuccessAndStop(BaseCallback):
+    """Save by sustained success after every eval; stop at threshold only on the final stage."""
+    def __init__(self, save_path, threshold, max_stage):
         super().__init__()
+        self.save_path = save_path
         self.threshold = threshold
         self.max_stage = max_stage
+        self.best_success = -np.inf
         self.curriculum = None        # set in main() so we can check the current stage
 
     def _on_step(self):
-        if self.curriculum is not None and self.curriculum.stage < self.max_stage:
-            return True               # not at the target stage yet -> keep training
         buf = getattr(self.parent, "_is_success_buffer", [])
         if len(buf) > 0:
             sr = float(np.mean(buf))
+            if sr > self.best_success:
+                self.best_success = sr
+                self.model.save(os.path.join(self.save_path, "best_success_model"))
+                print(f"[best_success] saved success_rate={sr:.2f} at "
+                      f"{self.num_timesteps} steps", flush=True)
+            if self.curriculum is not None and self.curriculum.stage < self.max_stage:
+                return True
             if sr >= self.threshold:
                 print(f"[stop_success] eval success_rate {sr:.2f} >= {self.threshold} at "
                       f"{self.num_timesteps} steps (stage {getattr(self.curriculum,'stage','?')}) "
                       f"-> stopping", flush=True)
                 return False          # stops training
+        return True
+
+
+class StopOnRetentionDrop(BaseCallback):
+    """Abort a fine-tune before it overwrites the clean-tilt skill."""
+    def __init__(self, clean_floor):
+        super().__init__()
+        self.clean_floor = float(clean_floor)
+
+    def _on_step(self):
+        buf = getattr(self.parent, "_is_success_buffer", [])
+        if buf:
+            success = float(np.mean(buf))
+            print(f"[retention_eval] clean_success={success:.2f}", flush=True)
+            if success < self.clean_floor:
+                print(
+                    f"[retention_guard] clean_success={success:.2f} < "
+                    f"{self.clean_floor:.2f} -> stopping",
+                    flush=True,
+                )
+                return False
         return True
 
 
@@ -165,7 +210,22 @@ def main():
     ap.add_argument("--n_eval", type=int, default=50)            # eval episodes (more = less noisy stop)
     ap.add_argument("--tqd", type=int, default=2)               # top_quantiles_to_drop (3=more conservative
                                                                 # critic, fights overestimation collapse)
+    ap.add_argument("--retention", action="store_true")         # full-model resume + balanced teacher replay
+    ap.add_argument("--teacher_data", default=None)             # fixed clean-tilt replay .npz
+    ap.add_argument("--learning_starts", type=int, default=10_000)
+    ap.add_argument("--actor_start", type=int, default=100_000) # critic-only adaptation before this step
+    ap.add_argument("--actor_lr", type=float, default=1e-6)
+    ap.add_argument("--critic_lr", type=float, default=3e-5)
+    ap.add_argument("--teacher_coef", type=float, default=100.0)
+    ap.add_argument("--teacher_fraction", type=float, default=0.5)
+    ap.add_argument("--clean_floor", type=float, default=0.60)
+    ap.add_argument("--p_corner", type=float, default=0.10,
+                    help="Probability that each DR draw is forced to a range endpoint")
     args = ap.parse_args()                                       # frees the arm to pump for swing-up
+    if args.retention and (not args.warmstart or not args.teacher_data):
+        ap.error("--retention requires --warmstart and --teacher_data")
+    if not 0.0 <= args.p_corner <= 1.0:
+        ap.error("--p_corner must be between 0 and 1")
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
     max_stage = args.max_stage if args.max_stage is not None else (4 if args.no_dr else len(STAGES) - 1)
@@ -173,40 +233,67 @@ def main():
     os.makedirs(MODELS, exist_ok=True)
 
     venv = VecMonitor(SubprocVecEnv([make_env(True, args.free_arm) for _ in range(args.nenv)]),
-                      info_keywords=("is_success",))
+                      info_keywords=("is_success", "is_catch_success"))
     # EVAL CONDITION: Phase B -> deployment (full swing-up + +-eval_tilt_deg random tilt + DR);
     # Phase A (--no_dr) -> nominal full swing-up, level, no DR. best_model.zip selected on this.
     # eval plant-DR: off for nominal (--no_dr) and tilt-no-DR (--no_plant_dr); on otherwise.
     eval_dr = not (args.no_dr or args.no_plant_dr)
     eval_env = VecMonitor(SubprocVecEnv([make_env(eval_dr, args.free_arm)]),
-                          info_keywords=("is_success",))
+                          info_keywords=("is_success", "is_catch_success"))
     # env_method (NOT set_attr — see Curriculum._apply / FurutaEnv.set_params)
     eval_env.env_method("set_params", init_angle_max=float(np.pi),
                         tilt_amp=float(np.deg2rad(0.0 if args.no_dr else args.eval_tilt_deg)),
-                        arm_center_w=args.arm_center_w)
-    venv.env_method("set_params", arm_center_w=args.arm_center_w)
+                        arm_center_w=args.arm_center_w,
+                        dr_probability=1.0, dr_scale=1.0, p_corner=args.p_corner)
+    venv.env_method("set_params", arm_center_w=args.arm_center_w, p_corner=args.p_corner)
+    print(f"[domain_randomization] p_corner={args.p_corner:.2f}", flush=True)
 
-    model = TQC(
-        "MlpPolicy", venv,
-        policy_kwargs=dict(net_arch=dict(pi=[64, 64], qf=[256, 256])),
-        learning_rate=args.lr, buffer_size=400_000, batch_size=512,
-        gamma=0.998, tau=0.005, train_freq=1, gradient_steps=max(4, args.nenv // 2),  # gamma: ~2.5s horizon @200Hz
-        learning_starts=10_000, ent_coef=ent_coef, target_entropy=target_entropy,
-        use_sde=args.use_sde, sde_sample_freq=64,   # default OFF (entropy-collapse fix; see args)
-        top_quantiles_to_drop_per_net=args.tqd, seed=args.seed,
-        device="cuda", verbose=1, tensorboard_log=os.path.join(HERE, "tb", args.tag),
-    )
-    if args.warmstart:   # Phase B: copy actor+critic weights from the Phase-A nominal master
-        src = TQC.load(args.warmstart, device="cuda")
-        model.policy.load_state_dict(src.policy.state_dict())
-        del src
-        print(f"[warmstart] loaded policy weights from {args.warmstart} "
-              f"(lr={args.lr}, ent_coef={ent_coef}, start_stage={args.start_stage})", flush=True)
+    if args.retention:
+        # Load the complete model so Adam moments and entropy state survive. The old warm-start
+        # path copied only neural-network weights and silently discarded optimizer state.
+        model = RetentionTQC.load(args.warmstart, env=venv, device="cuda")
+        model.tensorboard_log = os.path.join(HERE, "tb", args.tag)
+        model.verbose = 1
+        model.learning_starts = args.learning_starts
+        model.batch_size = 512
+        model.gradient_steps = max(4, args.nenv // 2)
+        model.seed = args.seed
+        model.set_random_seed(args.seed)
+        model.configure_retention(
+            args.teacher_data,
+            actor_lr=args.actor_lr,
+            critic_lr=args.critic_lr,
+            actor_start_steps=args.actor_start,
+            teacher_coef=args.teacher_coef,
+            teacher_fraction=args.teacher_fraction,
+        )
+        print(
+            f"[warmstart] resumed full model+optimizers from {args.warmstart} "
+            f"(learning_starts={model.learning_starts}, start_stage={args.start_stage})",
+            flush=True,
+        )
+    else:
+        model = TQC(
+            "MlpPolicy", venv,
+            policy_kwargs=dict(net_arch=dict(pi=[64, 64], qf=[256, 256])),
+            learning_rate=args.lr, buffer_size=400_000, batch_size=512,
+            gamma=0.998, tau=0.005, train_freq=1, gradient_steps=max(4, args.nenv // 2),
+            learning_starts=args.learning_starts, ent_coef=ent_coef, target_entropy=target_entropy,
+            use_sde=args.use_sde, sde_sample_freq=64,
+            top_quantiles_to_drop_per_net=args.tqd, seed=args.seed,
+            device="cuda", verbose=1, tensorboard_log=os.path.join(HERE, "tb", args.tag),
+        )
+        if args.warmstart:
+            src = TQC.load(args.warmstart, device="cuda")
+            model.policy.load_state_dict(src.policy.state_dict())
+            del src
+            print(f"[warmstart] loaded policy weights from {args.warmstart} "
+                  f"(lr={args.lr}, ent_coef={ent_coef}, start_stage={args.start_stage})", flush=True)
     curriculum = Curriculum(start_stage=args.start_stage, max_stage=max_stage,
                             force_no_dr=args.no_dr, no_plant_dr=args.no_plant_dr)
     stop_cb = None
     if args.stop_success is not None:
-        stop_cb = StopOnSuccess(args.stop_success, max_stage)
+        stop_cb = SaveBestSuccessAndStop(MODELS, args.stop_success, max_stage)
         stop_cb.curriculum = curriculum     # so it only fires at the final stage
         print(f"[stop_success] will stop when eval success_rate >= {args.stop_success} "
               f"at stage {max_stage} (n_eval={args.n_eval})", flush=True)
@@ -215,13 +302,43 @@ def main():
         EvalCallback(eval_env, best_model_save_path=MODELS, log_path=MODELS,
                      eval_freq=20_000 // args.nenv, n_eval_episodes=args.n_eval,
                      deterministic=True, callback_after_eval=stop_cb),
-        # periodic checkpoints so we can recover the PEAK policy if a run later regresses
-        CheckpointCallback(save_freq=max(100_000 // args.nenv, 1), save_path=MODELS,
-                           name_prefix="ckpt"),
     ]
+    if args.retention:
+        clean_eval_env = VecMonitor(
+            SubprocVecEnv([make_env(False, args.free_arm)]),
+            info_keywords=("is_success", "is_catch_success"),
+        )
+        clean_eval_env.env_method(
+            "set_params",
+            init_angle_max=float(np.pi),
+            tilt_amp=float(np.deg2rad(20.0)),
+            arm_center_w=args.arm_center_w,
+            randomize=False,
+            dr_probability=0.0,
+            dr_scale=0.0,
+        )
+        clean_guard = StopOnRetentionDrop(args.clean_floor)
+        callbacks.append(
+            EvalCallback(
+                clean_eval_env,
+                best_model_save_path=os.path.join(MODELS, "clean"),
+                log_path=os.path.join(MODELS, "clean"),
+                eval_freq=20_000 // args.nenv,
+                n_eval_episodes=args.n_eval,
+                deterministic=True,
+                callback_after_eval=clean_guard,
+            )
+        )
+    callbacks.append(
+        CheckpointCallback(
+            save_freq=max(100_000 // args.nenv, 1),
+            save_path=MODELS,
+            name_prefix="ckpt",
+        )
+    )
     model.learn(total_timesteps=args.steps, callback=callbacks, progress_bar=False)
     model.save(os.path.join(MODELS, "tqc_final"))
-    print("done; saved rl/models/tqc_final.zip and best_model.zip", flush=True)
+    print("done; saved tqc_final.zip, best_model.zip, and best_success_model.zip", flush=True)
 
 
 if __name__ == "__main__":

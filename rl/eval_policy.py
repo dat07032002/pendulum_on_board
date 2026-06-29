@@ -35,19 +35,21 @@ def main():
         env.init_angle_max = np.pi
         env.tilt_amp = float(np.deg2rad(args.tilt_deg))
         env.arm_limit = arm_limit
-        rews, succ, lens = [], [], []
+        rews, catches, succ, lens = [], [], [], []
         for ep in range(args.n):
             obs, _ = env.reset(seed=args.seed0 + ep)
-            done = trunc = False; R = L = s = 0
+            done = trunc = False; R = L = catch = s = 0
             while not (done or trunc):
                 a, _ = model.predict(obs, deterministic=True)
                 obs, r, done, trunc, info = env.step(a)
                 R += r; L += 1
-                if info.get("is_success"):
-                    s = 1
-            rews.append(R); succ.append(s); lens.append(L)
-        rews, succ, lens = map(np.array, (rews, succ, lens))
-        print(f"  [{arm_name:10s}] succ={succ.mean():.2f} ({int(succ.sum())}/{args.n})  "
+                if done or trunc:
+                    catch = int(info.get("is_catch_success", False))
+                    s = int(info.get("is_success", False))
+            rews.append(R); catches.append(catch); succ.append(s); lens.append(L)
+        rews, catches, succ, lens = map(np.array, (rews, catches, succ, lens))
+        print(f"  [{arm_name:10s}] sustained={succ.mean():.2f} ({int(succ.sum())}/{args.n})  "
+              f"catch={catches.mean():.2f}  "
               f"rew={rews.mean():.0f}+/-{rews.std():.0f}  eplen={lens.mean():.0f}/2000")
 
 

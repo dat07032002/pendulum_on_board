@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+from collections import deque
 
 import numpy as np
 import gymnasium as gym
@@ -75,6 +76,8 @@ class FurutaEnv(gym.Env):
         self.init_vel_assist = 0.0
         self.p_corner = 0.1              # fraction of DR draws pushed to a min/max extreme (was 0.3:
                                          # too aggressive -> stacked impossible multi-corner plants)
+        self.dr_probability = 1.0        # fraction of episodes with plant DR; rest rehearse clean
+        self.dr_scale = 1.0              # interpolate nominal -> sampled full-range parameters
         self.arm_envelope_w = 0.0        # >90deg arm penalty (0 = deployed-v1 behavior; off here)
         self.arm_center_w = 0.20         # arm-centering (phi/pi)^2 weight; LOWER it to allow the
                                          # arm to pump for swing-up (0.20 strangled it; ~0.02 frees it)
@@ -92,22 +95,30 @@ class FurutaEnv(gym.Env):
     # ---- domain randomization ----
     def _randomize(self):
         rng = self.np_random
-        if not self.randomize:
+        self._dr_active = False
+        if not self.randomize or rng.random() >= self.dr_probability:
             return
+        self._dr_active = True
+        scale = float(np.clip(self.dr_scale, 0.0, 1.0))
+
         def u(lo, hi):   # uniform, but with prob p_corner sample a min/max extreme
             if rng.random() < self.p_corner:            # -> trains worst-case corners, not just center
                 return lo if rng.random() < 0.5 else hi
             return rng.uniform(lo, hi)
-        self.model.actuator_gear[0, 0] = u(0.010, 0.016)                 # KM, ~+-25% of 0.0127 nominal
-                                                                         # (tightened from 0.008-0.020)
-        self.model.dof_damping[self.dadr_a] = u(3e-4, 10e-4)
-        self.model.dof_damping[self.dadr_p] = u(2e-5, 1.0e-4)
-        self.model.dof_frictionloss[self.dadr_a] = u(4e-3, 8e-3)
-        self.model.dof_frictionloss[self.dadr_p] = u(0.2e-3, 0.6e-3)
+
+        def blend(nominal, sampled):
+            return nominal + scale * (sampled - nominal)
+
+        self.model.actuator_gear[0, 0] = blend(self.nom["gear"], u(0.010, 0.016))
+        self.model.dof_damping[self.dadr_a] = blend(self.nom["dmp_a"], u(3e-4, 10e-4))
+        self.model.dof_damping[self.dadr_p] = blend(self.nom["dmp_p"], u(2e-5, 1.0e-4))
+        self.model.dof_frictionloss[self.dadr_a] = blend(self.nom["fr_a"], u(4e-3, 8e-3))
+        self.model.dof_frictionloss[self.dadr_p] = blend(self.nom["fr_p"], u(0.2e-3, 0.6e-3))
         bp = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "pole")
-        self.model.body_inertia[bp] = self.nom["inertia_p"] * u(0.92, 1.08)  # alpha +-8%
-        self._obs_noise = rng.uniform(0.0, 0.01)        # rad / (rad/s) scale
-        self._delay = int(rng.integers(1, 4))           # 1-3 step action latency (was 1-2)
+        self.model.body_inertia[bp] = self.nom["inertia_p"] * blend(1.0, u(0.92, 1.08))
+        self._obs_noise = scale * rng.uniform(0.0, 0.01)
+        sampled_delay = int(rng.integers(1, 4))
+        self._delay = int(round(1 + scale * (sampled_delay - 1)))
 
     def _restore_nominal(self):
         self.model.actuator_gear[0, 0] = self.nom["gear"]
@@ -131,6 +142,7 @@ class FurutaEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._restore_nominal()
+        self._dr_active = False
         self._obs_noise = 0.0
         self._delay = 1
         self._randomize()
@@ -151,6 +163,7 @@ class FurutaEnv(gym.Env):
         self.steps = 0
         self._up_streak = 0
         self._best_up_streak = 0
+        self._balance_window = deque(maxlen=int(2.0 / DT))
         self._was_up = False
         self.act_buf = [0.0] * self._delay
 
@@ -210,7 +223,8 @@ class FurutaEnv(gym.Env):
         self._imu_ctr += 1
         if self._imu_ctr >= IMU_DECIM:
             self._imu_ctr = 0
-            nb = self.beta_noise * self.np_random.standard_normal() if self.randomize else 0.0
+            nb = self.beta_noise * self.dr_scale * self.np_random.standard_normal() \
+                if self._dr_active else 0.0
             self._beta_meas = float(self.data.qpos[self.qadr_t]) + nb
             self._betad_meas = float(self.data.qvel[self.dadr_t])
 
@@ -241,7 +255,9 @@ class FurutaEnv(gym.Env):
         self.prev_action = a
 
         # success = pendulum upright (cos>0.9 ~25 deg, |thd|<4) AND (cable: arm bounded <90 deg)
-        if up > 0.9 and abs(thd) < 4.0 and arm_ok:
+        balanced = up > 0.9 and abs(thd) < 4.0 and arm_ok
+        self._balance_window.append(balanced)
+        if balanced:
             self._up_streak += 1
             self._best_up_streak = max(self._best_up_streak, self._up_streak)
         else:
@@ -263,7 +279,15 @@ class FurutaEnv(gym.Env):
         truncated = self.steps >= self.max_steps
         info = {}
         if terminated or truncated:
-            info["is_success"] = bool(self._best_up_streak * DT > 0.5)   # held upright >0.5 s
+            info["is_catch_success"] = bool(self._best_up_streak * DT > 0.5)
+            # Deployment success: finish normally and be balanced for at least 80% of the
+            # final two-second window. Unlike a continuous streak, this tolerates brief,
+            # harmless threshold crossings while still rejecting falls and unstable catches.
+            final_occupancy = float(np.mean(self._balance_window)) if self._balance_window else 0.0
+            info["final_balance_occupancy"] = final_occupancy
+            info["is_success"] = bool(
+                truncated and not terminated and final_occupancy >= 0.8
+            )
 
         if self.render_mode == "human":
             self._render_human()

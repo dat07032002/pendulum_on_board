@@ -1,11 +1,12 @@
 # HANDOFF — Furuta pendulum on a randomly-TILTING base (±30°)
 
-Last updated 2026-06-26. This is the full state + context so another agent can continue.
+Last updated 2026-06-29. This is the full state + context so another agent can continue.
 
-> ⭐ **NEWEST WORK: read `SESSION_2026-06-26.md` FIRST.** It supersedes the state below — nominal
-> swing-up+balance is now SOLVED (0.97 verified master `rl/models/nomB_fa_s0/best_model.zip`), but
-> tilt-robustification is not, and we found the SB3 DR eval is unreliable (over-reports badly). Verify
-> any policy with `rl/eval_policy.py`. Start from that file's §0.
+> ⭐ **NEWEST WORK: read `SESSION_2026-06-27_TO_29.md` FIRST**, then
+> `SESSION_2026-06-26.md` for earlier history. Phase C now uses a corrected sustained-success
+> definition, retention-aware TQC fine-tuning, and independent 500-episode verification. The best
+> verified full-DR ±20° model remains server-side `phasec_v3_verified63.zip` at 39.8% sustained
+> success; no-corner seed 2 (47% on only 100 episodes) is promising but still unverified.
 
 The step-plan lives at `~/.claude/plans/async-beaming-teapot.md` (the "ACTIVE PLAN" section at top).
 
