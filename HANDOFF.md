@@ -2,8 +2,13 @@
 
 Last updated 2026-06-29. This is the full state + context so another agent can continue.
 
-> ⭐ **NEWEST WORK: read `SESSION_2026-06-27_TO_29.md` FIRST**, then
-> `SESSION_2026-06-26.md` for earlier history. Phase C now uses a corrected sustained-success
+> **CURRENT OVERRIDE — read `SESSION_2026-06-29_CLEAN91_RESIDUAL_DR.md` first.**
+> Clean ±20° free-arm performance is now verified at **91.5% sustained (915/1000)**, and five
+> bounded-residual DR seeds are running. The older entropy-sweep and direct-retention actions below
+> are historical and must not be resumed.
+
+> **Earlier work:** read `SESSION_2026-06-27_TO_29.md`, then
+> `SESSION_2026-06-26.md` for prior history. Phase C introduced a corrected sustained-success
 > definition, retention-aware TQC fine-tuning, and independent 500-episode verification. The best
 > verified full-DR ±20° model remains server-side `phasec_v3_verified63.zip` at 39.8% sustained
 > success; no-corner seed 2 (47% on only 100 episodes) is promising but still unverified.

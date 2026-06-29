@@ -27,6 +27,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(__file__))
 from furuta_env import FurutaEnv  # noqa: E402
+from residual_env import ResidualActionWrapper  # noqa: E402
 
 from sb3_contrib import TQC  # noqa: E402
 from retention_tqc import RetentionTQC  # noqa: E402
@@ -53,11 +54,13 @@ STAGES = [
 ]
 
 
-def make_env(randomize=True, free_arm=False):
+def make_env(randomize=True, free_arm=False, residual_base=None, residual_scale=0.05):
     def _f():
         e = FurutaEnv(randomize=randomize)
         if free_arm:
             e.arm_limit = None          # remove the +-180deg cable termination (sim-only ceiling probe)
+        if residual_base:
+            e = ResidualActionWrapper(e, residual_base, residual_scale)
         return Monitor(e, info_keywords=("is_success", "is_catch_success"))
     return _f
 
@@ -135,11 +138,12 @@ class Curriculum(BaseCallback):
 
 class SaveBestSuccessAndStop(BaseCallback):
     """Save by sustained success after every eval; stop at threshold only on the final stage."""
-    def __init__(self, save_path, threshold, max_stage):
+    def __init__(self, save_path, threshold, max_stage, min_timesteps=0):
         super().__init__()
         self.save_path = save_path
         self.threshold = threshold
         self.max_stage = max_stage
+        self.min_timesteps = int(min_timesteps)
         self.best_success = -np.inf
         self.curriculum = None        # set in main() so we can check the current stage
 
@@ -147,12 +151,15 @@ class SaveBestSuccessAndStop(BaseCallback):
         buf = getattr(self.parent, "_is_success_buffer", [])
         if len(buf) > 0:
             sr = float(np.mean(buf))
-            if sr > self.best_success:
+            eligible = self.num_timesteps >= self.min_timesteps
+            if eligible and sr > self.best_success:
                 self.best_success = sr
                 self.model.save(os.path.join(self.save_path, "best_success_model"))
                 print(f"[best_success] saved success_rate={sr:.2f} at "
                       f"{self.num_timesteps} steps", flush=True)
             if self.curriculum is not None and self.curriculum.stage < self.max_stage:
+                return True
+            if not eligible:
                 return True
             if sr >= self.threshold:
                 print(f"[stop_success] eval success_rate {sr:.2f} >= {self.threshold} at "
@@ -211,6 +218,10 @@ def main():
     ap.add_argument("--tqd", type=int, default=2)               # top_quantiles_to_drop (3=more conservative
                                                                 # critic, fights overestimation collapse)
     ap.add_argument("--retention", action="store_true")         # full-model resume + balanced teacher replay
+    ap.add_argument("--residual_base", default=None,
+                    help="Freeze this policy and train only a bounded action residual")
+    ap.add_argument("--residual_scale", type=float, default=0.05,
+                    help="Maximum absolute residual added to the frozen base action")
     ap.add_argument("--teacher_data", default=None)             # fixed clean-tilt replay .npz
     ap.add_argument("--learning_starts", type=int, default=10_000)
     ap.add_argument("--actor_start", type=int, default=100_000) # critic-only adaptation before this step
@@ -221,32 +232,62 @@ def main():
     ap.add_argument("--clean_floor", type=float, default=0.60)
     ap.add_argument("--p_corner", type=float, default=0.10,
                     help="Probability that each DR draw is forced to a range endpoint")
+    ap.add_argument("--tilt_amp_min_fraction", type=float, default=0.30,
+                    help="Training-only minimum episode tilt amplitude as a fraction of the cap")
+    ap.add_argument("--tilt_rate_min", type=float, default=0.50,
+                    help="Training-only minimum episode tilt-rate cap [rad/s]")
     args = ap.parse_args()                                       # frees the arm to pump for swing-up
     if args.retention and (not args.warmstart or not args.teacher_data):
         ap.error("--retention requires --warmstart and --teacher_data")
+    if args.retention and args.residual_base:
+        ap.error("--retention and --residual_base are separate methods; choose one")
+    if args.residual_base and args.warmstart:
+        ap.error("--residual_base freezes the master; do not also pass --warmstart")
+    if not 0.0 < args.residual_scale <= 0.15:
+        ap.error("--residual_scale must be in (0, 0.15]")
     if not 0.0 <= args.p_corner <= 1.0:
         ap.error("--p_corner must be between 0 and 1")
+    if not 0.0 <= args.tilt_amp_min_fraction <= 1.0:
+        ap.error("--tilt_amp_min_fraction must be between 0 and 1")
+    if not 0.0 <= args.tilt_rate_min <= 2.0:
+        ap.error("--tilt_rate_min must be between 0 and 2 rad/s")
     ent_coef = args.ent_coef if args.ent_coef == "auto" else float(args.ent_coef)
     target_entropy = args.target_entropy if args.target_entropy == "auto" else float(args.target_entropy)
     max_stage = args.max_stage if args.max_stage is not None else (4 if args.no_dr else len(STAGES) - 1)
     MODELS = os.path.join(HERE, "models", args.tag)
     os.makedirs(MODELS, exist_ok=True)
 
-    venv = VecMonitor(SubprocVecEnv([make_env(True, args.free_arm) for _ in range(args.nenv)]),
+    venv = VecMonitor(SubprocVecEnv([
+        make_env(True, args.free_arm, args.residual_base, args.residual_scale)
+        for _ in range(args.nenv)
+    ]),
                       info_keywords=("is_success", "is_catch_success"))
     # EVAL CONDITION: Phase B -> deployment (full swing-up + +-eval_tilt_deg random tilt + DR);
     # Phase A (--no_dr) -> nominal full swing-up, level, no DR. best_model.zip selected on this.
     # eval plant-DR: off for nominal (--no_dr) and tilt-no-DR (--no_plant_dr); on otherwise.
     eval_dr = not (args.no_dr or args.no_plant_dr)
-    eval_env = VecMonitor(SubprocVecEnv([make_env(eval_dr, args.free_arm)]),
+    eval_env = VecMonitor(SubprocVecEnv([
+        make_env(eval_dr, args.free_arm, args.residual_base, args.residual_scale)
+    ]),
                           info_keywords=("is_success", "is_catch_success"))
     # env_method (NOT set_attr — see Curriculum._apply / FurutaEnv.set_params)
     eval_env.env_method("set_params", init_angle_max=float(np.pi),
                         tilt_amp=float(np.deg2rad(0.0 if args.no_dr else args.eval_tilt_deg)),
                         arm_center_w=args.arm_center_w,
                         dr_probability=1.0, dr_scale=1.0, p_corner=args.p_corner)
-    venv.env_method("set_params", arm_center_w=args.arm_center_w, p_corner=args.p_corner)
+    venv.env_method(
+        "set_params",
+        arm_center_w=args.arm_center_w,
+        p_corner=args.p_corner,
+        tilt_amp_min_fraction=args.tilt_amp_min_fraction,
+        tilt_rate_min=args.tilt_rate_min,
+    )
     print(f"[domain_randomization] p_corner={args.p_corner:.2f}", flush=True)
+    print(
+        f"[tilt_training] amp_fraction={args.tilt_amp_min_fraction:.2f}-1.00 "
+        f"rate_cap={args.tilt_rate_min:.2f}-2.00 rad/s",
+        flush=True,
+    )
 
     if args.retention:
         # Load the complete model so Adam moments and entropy state survive. The old warm-start
@@ -293,7 +334,15 @@ def main():
                             force_no_dr=args.no_dr, no_plant_dr=args.no_plant_dr)
     stop_cb = None
     if args.stop_success is not None:
-        stop_cb = SaveBestSuccessAndStop(MODELS, args.stop_success, max_stage)
+        min_save_steps = args.actor_start if args.retention else 0
+        if args.residual_base:
+            min_save_steps = args.learning_starts + 20_000
+        stop_cb = SaveBestSuccessAndStop(
+            MODELS,
+            args.stop_success,
+            max_stage,
+            min_timesteps=min_save_steps,
+        )
         stop_cb.curriculum = curriculum     # so it only fires at the final stage
         print(f"[stop_success] will stop when eval success_rate >= {args.stop_success} "
               f"at stage {max_stage} (n_eval={args.n_eval})", flush=True)
@@ -303,9 +352,14 @@ def main():
                      eval_freq=20_000 // args.nenv, n_eval_episodes=args.n_eval,
                      deterministic=True, callback_after_eval=stop_cb),
     ]
-    if args.retention:
+    # In a clean no-plant-DR continuation run, the primary evaluator already is the clean
+    # retention condition. Running a second identical callback doubles evaluation cost and can
+    # falsely stop a healthy seed on a noisy duplicate sample.
+    if (args.retention and not args.no_plant_dr) or args.residual_base:
         clean_eval_env = VecMonitor(
-            SubprocVecEnv([make_env(False, args.free_arm)]),
+            SubprocVecEnv([
+                make_env(False, args.free_arm, args.residual_base, args.residual_scale)
+            ]),
             info_keywords=("is_success", "is_catch_success"),
         )
         clean_eval_env.env_method(
@@ -328,6 +382,11 @@ def main():
                 deterministic=True,
                 callback_after_eval=clean_guard,
             )
+        )
+    elif args.retention:
+        print(
+            "[retention_eval] skipped duplicate clean evaluator; primary eval is already no-plant-DR",
+            flush=True,
         )
     callbacks.append(
         CheckpointCallback(

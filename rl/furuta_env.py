@@ -84,6 +84,8 @@ class FurutaEnv(gym.Env):
         self.arm_limit = ARM_LIMIT       # hard cable limit [rad]; set None to free the arm (diag)
         # tilt curriculum (set externally): max board-tilt amplitude this stage (0 = level ground)
         self.tilt_amp = 0.0
+        self.tilt_amp_min_fraction = 0.3
+        self.tilt_rate_min = 0.5
         self.tilt_betadot_max = 2.0      # cap on random tilt rate [rad/s] (Phase-0 feasible bound)
         self.beta_noise = 0.005          # IMU fusion noise on beta [rad] (~0.3 deg)
 
@@ -172,8 +174,8 @@ class FurutaEnv(gym.Env):
         # DECOUPLED from `randomize` (2026-06-27): tilt is the TASK, `randomize` is plant-DR. This
         # lets us train tilt WITHOUT plant-DR first, then add DR for robustness (`randomize=True`).
         if self.tilt_amp > 1e-4:
-            amp = rng.uniform(0.3, 1.0) * self.tilt_amp
-            rate = rng.uniform(0.5, self.tilt_betadot_max)
+            amp = rng.uniform(self.tilt_amp_min_fraction, 1.0) * self.tilt_amp
+            rate = rng.uniform(self.tilt_rate_min, self.tilt_betadot_max)
             self.tilt_gen = TiltGenerator(beta_max=amp, betadot_max=rate, dt=DT,
                                           mode="random", rng=rng)
         else:

@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
+.venv/
+rl/tb/
+*.log
+eval_*.npz
+rl/models/*/ckpt_*.zip
 serial_log.txt
 serial_in.txt
 .arduino-build/

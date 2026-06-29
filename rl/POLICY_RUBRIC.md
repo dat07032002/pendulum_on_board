@@ -68,3 +68,28 @@ BNO086 IMU. The policy must balance to **true (gravity) vertical**, not base-fra
 
 **Tilt quick ref:** tilt-sim-good = Pass 1-T + 3-T (under tilt+plant DR) + smoothness.
 deploy-ready = + Pass 4-T. done = Pass 5-T on the tilting rig.
+
+## Canonical independent evaluation
+
+Do not select a model from a training callback or a single 100-episode peak. Use deterministic
+inference over at least 500 fresh episodes, preserve the per-episode evidence, and record the model
+SHA-256 printed by the evaluator. Compare candidates on identical seeds:
+
+```bash
+python rl/eval_policy.py FIRST.zip --compare SECOND.zip \
+  --tilt_deg 20 --dr -n 500 --seed0 9000 --arm free \
+  --save_npz paired_eval_500.npz
+```
+
+For the final deployment gate, change to `--tilt_deg 30 --arm cable`. Review all reported metrics,
+not only sustained success:
+
+- sustained and catch success with 95% confidence intervals;
+- final true-vertical quality and post-catch balance occupancy;
+- action saturation and `mean|delta action|`;
+- maximum arm excursion and cable margin;
+- exposure and balance quality near `phi=+-90 deg`;
+- realized tilt amplitude/rate and DR draws.
+
+The paired confidence interval must support any claim that one checkpoint is better. A passing
+simulation result still requires the sign/scale and hardware gates above.
